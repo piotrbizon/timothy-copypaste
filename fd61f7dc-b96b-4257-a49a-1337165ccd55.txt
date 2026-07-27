@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         GEMINIaaa
+// @name         GEMINIabb
 // @namespace    http://tampermonkey.net/
 // @updateURL    https://raw.githubusercontent.com/piotrbizon/timothy-copypaste/refs/heads/main/fd61f7dc-b96b-4257-a49a-1337165ccd55.txt
 // @downloadURL  https://raw.githubusercontent.com/piotrbizon/timothy-copypaste/refs/heads/main/fd61f7dc-b96b-4257-a49a-1337165ccd55.txt
