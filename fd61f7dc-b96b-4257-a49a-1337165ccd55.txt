@@ -1,0 +1,2218 @@
+// ==UserScript==
+// @name         GEMINI
+// @namespace    http://tampermonkey.net/
+// @version      19.11
+// @description  Clickable dashboard isolated in a zero-impact Shadow DOM. Multi-stop/round-trip aware Google Maps routing (collapses consecutive duplicate stops); export uses first loading and last delivery times. Adds a separate "Posting" export with dedicated "Loading address"/"Delivery address" lines ([Country Code] [postcode] [city]), LDM/weight randomization, body-type/vehicle-size tags, and loading/delivery location obfuscation via Overpass+Nominatim with a selectable City Ranking Strategy (fixed: a city-center reverse-geocode sometimes lands on a quarter/neighborhood feature with no postcode tag at all, e.g. "NL Zwolle" with no postcode — now retries once at a finer zoom level when that happens) and verbose console logging ([TM-Obfuscate] prefix) for diagnosing any issues. Includes its own persistent settings panel and a "Paste Freight Info" option that runs pasted text through the exact same pipeline.
+// @author       Gemini
+// @match        https://my.timocom.com/*
+// @noframes
+// @grant        GM_setClipboard
+// @grant        GM.xmlHttpRequest
+// @connect      tinyurl.com
+// @connect      api.zippopotam.us
+// @connect      nominatim.openstreetmap.org
+// @connect      overpass-api.de
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Failsafe: Absolutely prevent execution inside chat/widget iframes
+    if (window.top !== window.self) return;
+
+    let currentOfferId = "";
+    let currentShortUrl = "";
+    let currentMapUrl = "";
+    let shadowRoot = null;
+    const box_title = "CCCKIMI";
+
+    // --- Configuration State & Memory ---
+    let config = {
+        showRoute: localStorage.getItem('tm-cfg-route') !== 'false',
+        showLoading: localStorage.getItem('tm-cfg-load') !== 'false',
+        showDelivery: localStorage.getItem('tm-cfg-del') !== 'false',
+        showDims: localStorage.getItem('tm-cfg-dims') !== 'false',
+        showNote: localStorage.getItem('tm-cfg-note') !== 'false',
+        offsetLoad: parseInt(localStorage.getItem('tm-cfg-off-load') || '0', 10),
+        offsetDel: parseInt(localStorage.getItem('tm-cfg-off-del') || '0', 10),
+        prefixText: localStorage.getItem('tm-cfg-prefix') || '',
+        suffixText: localStorage.getItem('tm-cfg-suffix') || ''
+    };
+    function saveConfig() {
+        localStorage.setItem('tm-cfg-route', config.showRoute);
+        localStorage.setItem('tm-cfg-load', config.showLoading);
+        localStorage.setItem('tm-cfg-del', config.showDelivery);
+        localStorage.setItem('tm-cfg-dims', config.showDims);
+        localStorage.setItem('tm-cfg-note', config.showNote);
+        localStorage.setItem('tm-cfg-off-load', config.offsetLoad);
+        localStorage.setItem('tm-cfg-off-del', config.offsetDel);
+        localStorage.setItem('tm-cfg-prefix', config.prefixText);
+        localStorage.setItem('tm-cfg-suffix', config.suffixText);
+    }
+
+    // --- "Posting" Export: Separate Config Namespace ---
+    // Entirely independent from the main export config above. Kept as a single
+    // JSON blob in localStorage so the (large) settings panel can be saved/loaded
+    // in one shot, and so future fields can be added without migrations.
+    const BODY_TYPES = ['sztywna zabudowa', 'skrzynia', 'standard', 'firanka', 'plandeka', 'chłodnia', 'izoterma'];
+    const VEHICLE_SIZES = ['z naczepą', 'solo', 'bus', 'z przyczepą'];
+    const POST_BTN_DEFAULT_TEXT = '📦 Organise & Copy for Posting';
+
+    function defaultPostingConfig() {
+        return {
+            showLoadingAddress: true,
+            showDeliveryAddress: true,
+            showLoading: true,
+            showDelivery: true,
+            showDims: true,
+            showNotes: true,
+            showBodyType: true,
+            showVehicleSize: true,
+            offsetLoad: 0,
+            offsetDel: 0,
+            labels: {
+                loadingAddress: 'Loading address',
+                deliveryAddress: 'Delivery address',
+                loading: 'Loading',
+                delivery: 'Delivery',
+                dims: 'LDM/ Wt',
+                notes: 'Notes',
+                bodyType: 'Typ nadwozia',
+                vehicleSize: 'Wielkość pojazdu'
+            },
+            jitter: {
+                bandA: { ldmMin: -1, ldmMax: 1.6, ldmStep: 0.2, ldmCap: 4, wtMin: -0.3, wtMax: 0.2, wtStep: 0.2, wtCap: 1 },
+                bandB: { ldmMin: -1, ldmMax: 1, ldmStep: 0.2, ldmCap: 6.3, wtMin: -0.3, wtMax: 0.2, wtStep: 0.2, wtCap: 3.2 },
+                // Catches everything that doesn't fall in Band A or B (e.g. a
+                // normal 13.6 LDM / 24t full truckload) so a jitter is ALWAYS
+                // applied, on every click, regardless of load size.
+                // ldmCap/wtCap = 0 means "no hard ceiling" (sizes vary too
+                // widely here to fix an absolute cap the way A/B do).
+                bandOther: { ldmMin: -0.6, ldmMax: 0.6, ldmStep: 0.2, ldmCap: 0, wtMin: -0.4, wtMax: 0.4, wtStep: 0.2, wtCap: 0 }
+            },
+            // Ordered, fully editable tag lists — each tag can be renamed,
+            // toggled, removed, or new ones added from the settings panel.
+            bodyTypeTags: BODY_TYPES.map(t => ({ text: t, enabled: true })),
+            vehicleSizeTags: VEHICLE_SIZES.map(t => ({ text: t, enabled: true })),
+            // Off by default: makes external geocoding calls, so it's opt-in.
+            // rankingMode: 'population' (largest first, original behavior),
+            // 'pop_per_dist' (mild proximity bias), or 'pop_per_dist2'
+            // (strong proximity bias / gravity-model style — penalizes
+            // distance quadratically, so a much-closer mid-sized town can
+            // outrank a huge city near the edge of the radius).
+            locationObfuscation: { obfuscateLoading: false, obfuscateDelivery: false, minKm: 10, maxKm: 100, rankingMode: 'population' }
+        };
+    }
+
+    // Shallow-aware recursive merge: lets old saved blobs pick up new default
+    // keys (e.g. after a script update adds a field) without losing user edits.
+    function deepMergeDefaults(base, override) {
+        let result = Array.isArray(base) ? base.slice() : Object.assign({}, base);
+        if (!override || typeof override !== 'object') return result;
+        for (let key in override) {
+            let baseVal = base ? base[key] : undefined;
+            let overVal = override[key];
+            if (overVal && typeof overVal === 'object' && !Array.isArray(overVal) && baseVal && typeof baseVal === 'object') {
+                result[key] = deepMergeDefaults(baseVal, overVal);
+            } else if (overVal !== undefined) {
+                result[key] = overVal;
+            }
+        }
+        return result;
+    }
+
+    // v18.0/18.1 stored tag inclusion as boolean maps keyed by the (then fixed)
+    // tag text. v18.2 made the tag lists themselves editable, so they're now
+    // ordered arrays. This carries forward anyone's existing checkbox choices
+    // the first time their saved config is loaded under the new format.
+    function migrateLegacyConfig(saved, defaults) {
+        if (saved && saved.bodyTypes && !saved.bodyTypeTags) {
+            defaults.bodyTypeTags = BODY_TYPES.map(t => ({ text: t, enabled: saved.bodyTypes[t] !== false }));
+            delete saved.bodyTypes;
+        }
+        if (saved && saved.vehicleSizes && !saved.vehicleSizeTags) {
+            defaults.vehicleSizeTags = VEHICLE_SIZES.map(t => ({ text: t, enabled: saved.vehicleSizes[t] !== false }));
+            delete saved.vehicleSizes;
+        }
+        // v18.4 had a single "enabled" flag covering loading only; v18.5 split
+        // it into obfuscateLoading/obfuscateDelivery. Carry the old value over.
+        if (saved && saved.locationObfuscation && 'enabled' in saved.locationObfuscation && !('obfuscateLoading' in saved.locationObfuscation)) {
+            defaults.locationObfuscation.obfuscateLoading = saved.locationObfuscation.enabled;
+            delete saved.locationObfuscation.enabled;
+        }
+        return defaults;
+    }
+
+    function loadPostingConfig() {
+        let defaults = defaultPostingConfig();
+        try {
+            let raw = localStorage.getItem('tm-cfg-posting');
+            if (!raw) return defaults;
+            let saved = JSON.parse(raw);
+            defaults = migrateLegacyConfig(saved, defaults);
+            return deepMergeDefaults(defaults, saved);
+        } catch (e) {
+            return defaults;
+        }
+    }
+
+    function savePostingConfig() {
+        localStorage.setItem('tm-cfg-posting', JSON.stringify(config.posting));
+    }
+
+    config.posting = loadPostingConfig();
+
+    // --- Core Extraction Utilities (Reads from Main Page) ---
+    function getTextByTestId(id) {
+        const el = document.querySelector(`[data-testid="${id}"]`);
+        return el ? el.textContent.replace(/\u00A0/g, ' ').trim() : "";
+    }
+
+    function extractDigits(text) {
+        if (!text) return "";
+        const match = text.match(/[\d.]+/);
+        return match ? match[0] : "";
+    }
+
+    function mergeRange(earliest, latest, defaultVal) {
+        if (!earliest && !latest) return defaultVal;
+        let cleanE = earliest ? earliest.replace(/\.$/, '').trim() : "";
+        let cleanL = latest ? latest.replace(/\.$/, '').trim() : "";
+
+        if (cleanE && cleanL && cleanE !== cleanL) {
+            if (cleanE.includes('-')) return cleanE;
+            return `${cleanE} - ${cleanL}`;
+        }
+        return cleanE || cleanL;
+    }
+
+    function offsetTimeStr(timeStr, hoursToAdd) {
+        if (!timeStr || !timeStr.includes(':')) return timeStr;
+        if (hoursToAdd === 0 || isNaN(hoursToAdd)) return timeStr;
+
+        let parts = timeStr.split(':');
+        let h = parseInt(parts[0], 10);
+        let m = parseInt(parts[1], 10);
+        if (isNaN(h) || isNaN(m)) return timeStr;
+
+        h += hoursToAdd;
+        if (h >= 24) h = h % 24;
+        if (h < 0) h = 24 + (h % 24);
+
+        let hStr = h < 10 ? '0' + h : h;
+        let mStr = m < 10 ? '0' + m : m;
+        return `${hStr}:${mStr}`;
+    }
+
+    // --- Asynchronous TinyURL Shortener ---
+    function fetchShortenedUrl(longUrl) {
+        return new Promise((resolve) => {
+            GM.xmlHttpRequest({
+                method: 'GET',
+                url: `https://tinyurl.com/api-create.php?url=${encodeURIComponent(longUrl)}`,
+                timeout: 4000,
+                onload: function(response) {
+                    if (response.status === 200 && response.responseText) {
+                        resolve(response.responseText.trim());
+                    } else {
+                        resolve(longUrl);
+                    }
+                },
+                onerror: function() { resolve(longUrl); },
+                ontimeout: function() { resolve(longUrl); }
+            });
+        });
+    }
+
+    // --- Multi-Stop Collector ---
+    // Walks LoadingPlacesView/*_N for N = 0,1,2,... until no place is found.
+    // Each TimoCom "loading place" row is a stop (loading OR unloading); a round
+    // trip A -> B -> B -> A is exposed as four stops: A, B, B, A.
+    function collectStops() {
+        let stops = [];
+        for (let i = 0; i < 12; i++) {
+            let country = getTextByTestId(`LoadingPlacesView/loadingPlaceCountry_${i}`);
+            let city = getTextByTestId(`LoadingPlacesView/loadingPlaceCity_${i}`);
+            if (!country && !city) break;
+
+            let eDate = getTextByTestId(`LoadingPlacesView/earliestLoadingDate_${i}`);
+            let lDate = getTextByTestId(`LoadingPlacesView/latestLoadingDate_${i}`);
+            let eTime = getTextByTestId(`LoadingPlacesView/earliestLoadingTime_${i}`);
+            let lTime = getTextByTestId(`LoadingPlacesView/latestLoadingTime_${i}`);
+
+            stops.push({
+                index: i,
+                country: country,
+                city: city,
+                addr: `${country} ${city}`.trim(),
+                eDate: eDate,
+                lDate: lDate,
+                eTime: eTime,
+                lTime: lTime
+            });
+        }
+        return stops;
+    }
+
+    // --- Google Maps URL Builder (consecutive-duplicate aware) ---
+    // Keeps every address in order, but collapses any address that is listed
+    // immediately after an identical one. So [A, B, B, A] -> [A, B, A]
+    // (B appears once), while a non-round trip [A, B, C] is left untouched.
+    function buildMapsUrl(stops) {
+        let addrs = stops.map(s => s.addr).filter(a => a);
+
+        let deduped = [];
+        for (let a of addrs) {
+            let prev = deduped.length ? deduped[deduped.length - 1] : null;
+            if (!prev || prev.toLowerCase() !== a.toLowerCase()) deduped.push(a);
+        }
+
+        if (deduped.length === 0) return "";
+        if (deduped.length === 1) {
+            return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(deduped[0])}`;
+        }
+
+        let origin = deduped[0];
+        let destination = deduped[deduped.length - 1];
+        let waypoints = deduped.slice(1, -1);
+
+        let url = `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&travelmode=driving`;
+        if (waypoints.length) {
+            url += `&waypoints=${waypoints.map(w => encodeURIComponent(w)).join('|')}`;
+        }
+        return url;
+    }
+
+    // --- Postcode Extraction ---
+    // City field looks like ", 41001 Sevilla" / ", 1234 AB Amsterdam".
+    // Pulls the leading postcode token(s): numeric tokens, plus a trailing
+    // short all-caps token (NL/UK second segment). Falls back to the city name.
+    // City field looks like ", 41001 Sevilla" / ", 1234 AB Amsterdam" / just
+    // ", Westertimke" when there's no postcode at all. Splits it into the
+    // leading postcode-like tokens (digits, plus a trailing short all-caps
+    // suffix like NL/UK use) and whatever city name text follows. When no
+    // postcode tokens are found, the whole string is treated as the city
+    // name (matching extractPostcode's long-standing fallback behavior).
+    function splitPostcodeAndCity(city) {
+        if (!city) return { postcode: "", cityName: "" };
+        let c = city.replace(/^[\s,]+/, '').trim();
+        if (!c) return { postcode: "", cityName: "" };
+        let tokens = c.split(/\s+/);
+        let pc = [];
+        let i = 0;
+        for (; i < tokens.length; i++) {
+            let t = tokens[i];
+            if (/\d/.test(t)) { pc.push(t); continue; }
+            if (pc.length && /^[A-Z]{1,3}$/.test(t)) { pc.push(t); continue; }
+            break;
+        }
+        if (pc.length) return { postcode: pc.join(' '), cityName: tokens.slice(i).join(' ') };
+        return { postcode: "", cityName: c };
+    }
+
+    function extractPostcode(city) {
+        let parts = splitPostcodeAndCity(city);
+        return parts.postcode || parts.cityName;
+    }
+
+    // --- Posting Export: "Loading address" / "Delivery address" Lines ---
+    // "[Country Code] [postcode] [city]" — skips any piece that's missing
+    // (e.g. no postcode found) rather than leaving a stray double space.
+    function buildAddressLine(stop) {
+        if (!stop) return '';
+        let { postcode, cityName } = splitPostcodeAndCity(stop.city);
+        return [stop.country, postcode, cityName].filter(p => p && p.trim()).join(' ');
+    }
+
+    function buildAddressLineFromPlace(place) {
+        if (!place) return '';
+        return [place.countryCode, place.postcode, place.city].filter(p => p && p.trim()).join(' ');
+    }
+
+    // --- Country-Code + Postcode Array Builder (shared) ---
+    // Produces the ordered, consecutive-duplicate-collapsed "CC-postcode" list
+    // that both the "All" and "First+Last" route modes are built from, and
+    // that the Posting export's loading-location obfuscation also edits.
+    function getCodesArray(stops, separator) {
+        separator = separator || '-';
+        let parts = stops
+            .map(s => {
+                let pc = extractPostcode(s.city);
+                return s.country ? (pc ? `${s.country}${separator}${pc}` : s.country) : pc;
+            })
+            .filter(p => p);
+
+        let deduped = [];
+        for (let p of parts) {
+            let prev = deduped.length ? deduped[deduped.length - 1] : null;
+            if (!prev || prev.toLowerCase() !== p.toLowerCase()) deduped.push(p);
+        }
+        return deduped;
+    }
+
+    // --- Country-Code + Postcode Route Builder ---
+    // Same consecutive-duplicate collapsing as the map URL, rendered as
+    // "ES-41001 > HU-5630" (every loading/destination stop included).
+    function buildCodesRoute(stops) {
+        return getCodesArray(stops).join(' > ');
+    }
+
+    // --- Posting Export: LDM / Weight Randomization ---
+    // Builds the list of valid offsets between min/max stepped by `step`,
+    // anchored at `min` (so ranges that don't divide evenly, e.g. -0.3..0.2
+    // in 0.2 steps, still produce a well-defined, reproducible candidate set).
+    function genStepCandidates(min, max, step) {
+        let vals = [];
+        step = Math.abs(step) || 0.2;
+        let v = min;
+        let guard = 0;
+        while (v <= max + 1e-9 && guard < 500) {
+            vals.push(Math.round(v * 100) / 100);
+            v += step;
+            guard++;
+        }
+        if (!vals.length) vals.push(0);
+        return vals;
+    }
+
+    function randomOffset(min, max, step) {
+        let candidates = genStepCandidates(min, max, step);
+        return candidates[Math.floor(Math.random() * candidates.length)];
+    }
+
+    // Applies the configured jitter rules to a raw LDM/weight pair. Always
+    // picks a band — Band A, Band B, or the "Other" fallback for anything
+    // outside both — so every call (i.e. every click of "Organise & Copy for
+    // Posting") produces a freshly randomized result, never a pass-through.
+    // A small safety floor (0.2 LDM / 0.1t) keeps the offset from ever
+    // producing a zero or negative value. A cap of 0 means "no hard ceiling".
+    function jitterDims(ldmRaw, wtRaw) {
+        let ldm = parseFloat(ldmRaw);
+        let wt = parseFloat(wtRaw);
+        if (isNaN(ldm)) ldm = 0;
+        if (isNaN(wt)) wt = 0;
+
+        let j = config.posting.jitter;
+        let band;
+        if (ldm < 4 && wt < 1) {
+            band = j.bandA;
+        } else if (ldm >= 4 && ldm <= 6.3 && wt >= 1 && wt <= 3.2) {
+            band = j.bandB;
+        } else {
+            band = j.bandOther;
+        }
+
+        ldm += randomOffset(band.ldmMin, band.ldmMax, band.ldmStep);
+        wt += randomOffset(band.wtMin, band.wtMax, band.wtStep);
+
+        ldm = Math.max(0.2, ldm);
+        wt = Math.max(0.1, wt);
+        if (band.ldmCap > 0) ldm = Math.min(band.ldmCap, ldm);
+        if (band.wtCap > 0) wt = Math.min(band.wtCap, wt);
+
+        return {
+            ldm: Math.round(ldm * 10) / 10,
+            wt: Math.round(wt * 10) / 10
+        };
+    }
+
+    // --- Posting Export: Date Format ("22.06" -> "22/06") ---
+    function slashDate(str) {
+        return str ? str.replace(/\./g, '/') : str;
+    }
+
+    // --- Posting Export: Configurable Line Labels ---
+    // Lets the field name in front of each line (e.g. "Wielkość pojazdu") be
+    // renamed from the settings panel (e.g. to "vehicleSizeId"). An empty
+    // label drops the "Label: " prefix entirely instead of leaving a bare colon.
+    function withLabel(label, value) {
+        return label ? `${label}: ${value}` : value;
+    }
+
+    // --- Posting Export: Keyword-Only Notes ---
+    // Distills the free-text description/remarks down to a short, normalized
+    // keyword list (e.g. "ADR, LIFT") rather than re-posting the raw text.
+    function extractNotesKeywords(text) {
+        if (!text) return "";
+        let found = [];
+        if (/\badr/i.test(text)) found.push('ADR');
+        if (/\blift/i.test(text)) found.push('LIFT');
+        if (/\b(pallet|plt|pal|epal)/i.test(text)) found.push('PALLETS');
+        return found.join(', ');
+    }
+
+    // --- Posting Export: "Paste Freight Info" Parser ---
+    // Pulls loading/delivery country+postcode, dates/times, LDM/weight, and
+    // notes text out of arbitrary pasted freight info — built to read this
+    // script's own export formats (old hyphenated or new space-separated
+    // codes, "Loading:"/"Delivery:"/"LDM/ Wt:" lines) but tolerant of minor
+    // variations. Returns a stops[] array shaped exactly like collectStops(),
+    // so every downstream function (route building, obfuscation, jitter,
+    // labels, tags) runs completely unchanged regardless of the data source.
+    function parseDateTimeFragment(str) {
+        if (!str) return { date: '', time: '' };
+        let timeMatch = str.match(/(\d{1,2}):(\d{2})/);
+        let time = timeMatch ? `${timeMatch[1].padStart(2, '0')}:${timeMatch[2]}` : '';
+        let rangeMatch = str.match(/(\d{1,2}[.\/]\d{1,2}(?:[.\/]\d{2,4})?)\s*-\s*(\d{1,2}[.\/]\d{1,2}(?:[.\/]\d{2,4})?)/);
+        if (rangeMatch) return { date: `${rangeMatch[1].replace(/\//g, '.')} - ${rangeMatch[2].replace(/\//g, '.')}`, time };
+        let singleMatch = str.match(/\d{1,2}[.\/]\d{1,2}(?:[.\/]\d{2,4})?/);
+        return { date: singleMatch ? singleMatch[0].replace(/\//g, '.') : '', time };
+    }
+
+    function parsePastedFreightText(text) {
+        if (!text || !text.trim()) return null;
+
+        // "NL-7511", "DE 26452", "ES14009", optionally with a trailing
+        // letter segment (e.g. NL postcodes' "AB" suffix).
+        let codeMatches = [...text.matchAll(/\b([A-Z]{2})[\s-]+(\d{3,6}(?:[\s-][A-Z]{1,3})?)\b/g)];
+
+        let loadingCountry = '', loadingPc = '', deliveryCountry = '', deliveryPc = '';
+        if (codeMatches.length) {
+            loadingCountry = codeMatches[0][1];
+            loadingPc = codeMatches[0][2].trim();
+            let last = codeMatches[codeMatches.length - 1];
+            deliveryCountry = last[1];
+            deliveryPc = last[2].trim();
+        }
+
+        let loadFrag = (text.match(/loading[^:]*:\s*([^\n\r]+)/i) || [])[1] || '';
+        let delFrag = (text.match(/delivery[^:]*:\s*([^\n\r]+)/i) || [])[1] || '';
+        let loadDT = parseDateTimeFragment(loadFrag);
+        let delDT = parseDateTimeFragment(delFrag);
+
+        // Prefer a dedicated LDM/weight line if one is found; fall back to
+        // scanning the whole text for a "<number>m" / "<number>t" pattern.
+        let dimsLine = (text.match(/(?:ldm\s*\/?\s*wt|ldm|weight)[^:]*:\s*([^\n\r]+)/i) || [])[1] || text;
+        let ldmMatch = dimsLine.match(/(\d+(?:[.,]\d+)?)\s*m\b/i) || text.match(/(\d+(?:[.,]\d+)?)\s*m\b/i);
+        let wtMatch = dimsLine.match(/(\d+(?:[.,]\d+)?)\s*t\b/i) || text.match(/(\d+(?:[.,]\d+)?)\s*t\b/i);
+        let ldmRaw = ldmMatch ? ldmMatch[1].replace(',', '.') : '';
+        let wtRaw = wtMatch ? wtMatch[1].replace(',', '.') : '';
+
+        let stops = [];
+        if (loadingCountry || loadDT.date) {
+            stops.push({
+                index: 0, country: loadingCountry, city: loadingPc ? `, ${loadingPc}` : '',
+                addr: `${loadingCountry} ${loadingPc}`.trim(), eDate: '', lDate: loadDT.date, eTime: '', lTime: loadDT.time
+            });
+        }
+        if (deliveryCountry || delDT.date) {
+            stops.push({
+                index: 1, country: deliveryCountry, city: deliveryPc ? `, ${deliveryPc}` : '',
+                addr: `${deliveryCountry} ${deliveryPc}`.trim(), eDate: '', lDate: delDT.date, eTime: '', lTime: delDT.time
+            });
+        }
+
+        // Nothing at all recognized — let the caller show an error instead of
+        // silently producing an empty/placeholder export.
+        if (!stops.length && !ldmRaw && !wtRaw) return null;
+
+        return { stops, ldmRaw, wtRaw, notesText: text };
+    }
+
+    // --- Posting Export: Loading / Delivery Location Obfuscation ---
+    // Replaces the LOADING and/or DELIVERY stop's "CC-postcode" with a real
+    // nearby place at a random distance inside [minKm, maxKm] from the true
+    // postcode, in a random direction. Each end is toggled independently;
+    // any other (intermediate) stops are always left untouched.
+    // Two free, no-key public APIs are used (GM.xmlHttpRequest bypasses CORS):
+    //   1. api.zippopotam.us   — forward geocode: postcode -> lat/lon
+    //   2. nominatim.openstreetmap.org — reverse geocode: lat/lon -> real place
+    // Any failure (unsupported country, network error, no result) falls back
+    // to leaving the real code in place rather than breaking the copy.
+
+    function deg2rad(d) { return d * Math.PI / 180; }
+
+    // Strips a postcode down to its digit/hyphen core for the geocoding APIs
+    // (e.g. NL "7511 AB" -> "7511"; PL "30-001" is already fine as-is).
+    function postcodeForGeocode(postcode) {
+        if (!postcode) return "";
+        let trimmed = postcode.trim();
+        if (!trimmed) return "";
+
+        // Digit-led postcodes (NL "7511 AB", PL "30-001", DE/FR/ES 5-digit,
+        // etc.) — Zippopotam wants just the leading digit/hyphen core,
+        // without any trailing letter suffix.
+        if (/^\d/.test(trimmed)) {
+            let m = trimmed.match(/\d[\d\s-]*\d|\d+/);
+            return m ? m[0].replace(/\s+/g, '') : trimmed;
+        }
+
+        // Letter-led / alphanumeric postcodes (UK "PE19 2", Canada
+        // "K1A 0B1") — the letters ARE the postcode; stripping them to
+        // digits-only (e.g. "PE19 2" -> "192") destroys the part that
+        // actually identifies the location. Just normalize whitespace.
+        return trimmed.replace(/\s+/g, ' ');
+    }
+
+    function geocodePostcode(countryCode, postcode) {
+        return new Promise((resolve) => {
+            if (!countryCode || !postcode) { resolve(null); return; }
+            let url = `https://api.zippopotam.us/${encodeURIComponent(countryCode.trim().toLowerCase())}/${encodeURIComponent(postcode)}`;
+            console.log('[TM-Obfuscate] GET', url);
+            GM.xmlHttpRequest({
+                method: 'GET',
+                url,
+                timeout: 4000,
+                onload: (resp) => {
+                    try {
+                        console.log('[TM-Obfuscate] zippopotam response status=%s body=%s', resp.status, (resp.responseText || '').slice(0, 300));
+                        if (resp.status !== 200) { resolve(null); return; }
+                        let data = JSON.parse(resp.responseText);
+                        let place = data.places && data.places[0];
+                        if (!place) { resolve(null); return; }
+                        let lat = parseFloat(place.latitude);
+                        let lon = parseFloat(place.longitude);
+                        if (isNaN(lat) || isNaN(lon)) { console.warn('[TM-Obfuscate] zippopotam returned a place with non-numeric lat/lon:', place); resolve(null); return; }
+                        resolve({ lat, lon });
+                    } catch (e) { console.error('[TM-Obfuscate] zippopotam response parse error:', e); resolve(null); }
+                },
+                onerror: (err) => { console.error('[TM-Obfuscate] zippopotam request ERROR (likely blocked/CORS/permission):', err); resolve(null); },
+                ontimeout: () => { console.warn('[TM-Obfuscate] zippopotam request TIMED OUT'); resolve(null); }
+            });
+        });
+    }
+
+    // --- Nominatim Rate Limiter ---
+    // Nominatim's usage policy caps public requests at ~1/second. Loading and
+    // delivery obfuscation fire their reverse-geocode calls concurrently (and
+    // repeated clicks can come in quick succession), which was silently
+    // hitting that limit and falling back to the real address far more often
+    // than it should. This serializes every reverse-geocode call through a
+    // shared queue with a minimum spacing, regardless of how many lookups are
+    // in flight at once or how fast the buttons get clicked.
+    let nominatimQueueReadyAt = 0;
+    const NOMINATIM_MIN_INTERVAL_MS = 1100;
+
+    function waitForNominatimSlot() {
+        return new Promise((resolve) => {
+            let now = Date.now();
+            let runAt = Math.max(now, nominatimQueueReadyAt);
+            nominatimQueueReadyAt = runAt + NOMINATIM_MIN_INTERVAL_MS;
+            setTimeout(resolve, runAt - now);
+        });
+    }
+
+    function reverseGeocodeOnce(lat, lon, zoom) {
+        return new Promise((resolve) => {
+            let url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=${zoom || 14}&addressdetails=1`;
+            console.log('[TM-Obfuscate] GET', url);
+            GM.xmlHttpRequest({
+                method: 'GET',
+                url,
+                timeout: 5000,
+                headers: { 'Accept-Language': 'en', 'User-Agent': 'TimoCom-Cargo-Formatter-UserScript' },
+                onload: (resp) => {
+                    try {
+                        console.log('[TM-Obfuscate] nominatim reverse response status=%s body=%s', resp.status, (resp.responseText || '').slice(0, 300));
+                        if (resp.status !== 200) { resolve(null); return; }
+                        let data = JSON.parse(resp.responseText);
+                        let addr = data.address || {};
+                        let cc = (addr.country_code || '').toUpperCase();
+                        if (!cc) { resolve(null); return; }
+                        resolve({ countryCode: cc, postcode: addr.postcode || '', city: addr.city || addr.town || addr.village || addr.municipality || '' });
+                    } catch (e) { console.error('[TM-Obfuscate] nominatim reverse parse error:', e); resolve(null); }
+                },
+                onerror: (err) => { console.error('[TM-Obfuscate] nominatim reverse request ERROR (likely blocked/CORS/permission):', err); resolve(null); },
+                ontimeout: () => { console.warn('[TM-Obfuscate] nominatim reverse request TIMED OUT'); resolve(null); }
+            });
+        });
+    }
+
+    // Serialized through the rate limiter above, with one retry (after
+    // re-queuing for another slot) if the first attempt comes back empty —
+    // covers transient throttling/network blips rather than giving up
+    // immediately and silently falling back to the real address.
+    async function reverseGeocode(lat, lon, zoom) {
+        await waitForNominatimSlot();
+        let result = await reverseGeocodeOnce(lat, lon, zoom);
+        if (result) return result;
+
+        await waitForNominatimSlot();
+        return reverseGeocodeOnce(lat, lon, zoom);
+    }
+
+    // --- Forward Geocode By City Name (Nominatim) ---
+    // Zippopotam (geocodePostcode above) only understands actual postal
+    // codes. Plenty of real addresses have none — e.g. a bare city name with
+    // no digits at all — which used to send that city name to Zippopotam AS
+    // IF it were a postcode, fail every time, and silently fall back to the
+    // real address regardless of anything else. This is the missing other
+    // half: geocode by name instead, through the same Nominatim instance
+    // (so it goes through the same rate-limit queue) when there's no
+    // postcode to work with.
+    function geocodeCityNameOnce(countryCode, cityName) {
+        return new Promise((resolve) => {
+            if (!countryCode || !cityName) { resolve(null); return; }
+            let url = `https://nominatim.openstreetmap.org/search?format=jsonv2&city=${encodeURIComponent(cityName)}&countrycodes=${encodeURIComponent(countryCode.trim().toLowerCase())}&limit=1`;
+            console.log('[TM-Obfuscate] GET', url);
+            GM.xmlHttpRequest({
+                method: 'GET',
+                url,
+                timeout: 5000,
+                headers: { 'Accept-Language': 'en', 'User-Agent': 'TimoCom-Cargo-Formatter-UserScript' },
+                onload: (resp) => {
+                    try {
+                        console.log('[TM-Obfuscate] nominatim search response status=%s body=%s', resp.status, (resp.responseText || '').slice(0, 300));
+                        if (resp.status !== 200) { resolve(null); return; }
+                        let data = JSON.parse(resp.responseText);
+                        if (!data || !data.length) { resolve(null); return; }
+                        let lat = parseFloat(data[0].lat);
+                        let lon = parseFloat(data[0].lon);
+                        if (isNaN(lat) || isNaN(lon)) { resolve(null); return; }
+                        resolve({ lat, lon });
+                    } catch (e) { console.error('[TM-Obfuscate] nominatim search parse error:', e); resolve(null); }
+                },
+                onerror: (err) => { console.error('[TM-Obfuscate] nominatim search request ERROR (likely blocked/CORS/permission):', err); resolve(null); },
+                ontimeout: () => { console.warn('[TM-Obfuscate] nominatim search request TIMED OUT'); resolve(null); }
+            });
+        });
+    }
+
+    async function geocodeCityName(countryCode, cityName) {
+        await waitForNominatimSlot();
+        let result = await geocodeCityNameOnce(countryCode, cityName);
+        if (result) return result;
+
+        await waitForNominatimSlot();
+        return geocodeCityNameOnce(countryCode, cityName);
+    }
+
+    // Generic "find a real nearby place" lookup for any single stop — used
+    // for both the loading and delivery obfuscation toggles below.
+
+    // Great-circle distance between two points, km — used to score candidate
+    // points against the history of previously-picked points for this offer.
+    function haversineKm(lat1, lon1, lat2, lon2) {
+        const R = 6371;
+        const dLat = deg2rad(lat2 - lat1);
+        const dLon = deg2rad(lon2 - lon1);
+        const a = Math.sin(dLat / 2) ** 2 + Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * Math.sin(dLon / 2) ** 2;
+        return R * 2 * Math.asin(Math.sqrt(Math.min(1, a)));
+    }
+
+    // --- Overpass API: Real Cities/Towns/Villages By Population ---
+    // Queries OpenStreetMap (via the free, no-key Overpass API) for populated
+    // places within maxKm of the origin, then filters to the [minKm, maxKm]
+    // annulus and sorts descending by population. This is what makes "largest
+    // city first, then next-largest, etc." possible — picking a random point
+    // and reverse-geocoding it (the old approach) had no notion of city size.
+    // Trimmed, lowercased, diacritic-stripped — for exact (not substring)
+    // name comparisons, so accent/encoding differences between Overpass and
+    // the stop's own city text don't cause a false mismatch.
+    function normalizeNameForCompare(s) {
+        return (s || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    }
+
+    function cleanCityNameForSearch(name) {
+        if (!name) return "";
+        return name.replace(/\s*\([^)]*\)\s*$/, '').trim();
+    }
+
+    // Single raw Overpass query -> elements[] (or null on failure). Logged
+    // and timed-out identically regardless of which place-type filter is
+    // used by the caller.
+    function queryOverpassRaw(query) {
+        return new Promise((resolve) => {
+            let url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+            console.log('[TM-Obfuscate] Overpass query:', query);
+            console.log('[TM-Obfuscate] GET', url);
+            GM.xmlHttpRequest({
+                method: 'GET',
+                url,
+                timeout: 30000, // must exceed the [timeout:25] set in the query itself, plus margin
+                headers: { 'Accept': '*/*', 'User-Agent': 'TimoCom-Cargo-Formatter-UserScript' },
+                onload: (resp) => {
+                    try {
+                        console.log('[TM-Obfuscate] overpass response status=%s bodyLength=%s', resp.status, (resp.responseText || '').length);
+                        if (resp.status !== 200) { console.warn('[TM-Obfuscate] overpass non-200 body:', (resp.responseText || '').slice(0, 500)); resolve(null); return; }
+                        let data = JSON.parse(resp.responseText);
+                        let elements = data.elements || [];
+                        console.log('[TM-Obfuscate] overpass raw element count:', elements.length);
+                        resolve(elements);
+                    } catch (e) { console.error('[TM-Obfuscate] overpass response parse error:', e); resolve(null); }
+                },
+                onerror: (err) => { console.error('[TM-Obfuscate] overpass request ERROR (likely blocked/CORS/permission):', err); resolve(null); },
+                ontimeout: () => { console.warn('[TM-Obfuscate] overpass request TIMED OUT'); resolve(null); }
+            });
+        });
+    }
+
+    function elementToCity(el) {
+        let pop = parseInt(String((el.tags && el.tags.population) || '0').replace(/[^\d]/g, ''), 10);
+        return { name: (el.tags && el.tags.name) || '', lat: el.lat, lon: el.lon, population: isNaN(pop) ? 0 : pop };
+    }
+
+    function isUsableCity(c) {
+        return !!(c.name && c.population > 0 && typeof c.lat === 'number' && typeof c.lon === 'number' && !isNaN(c.lat) && !isNaN(c.lon));
+    }
+
+    // Two-tier query: city/town first — a much smaller dataset than
+    // including villages, which matters in densely-mapped regions (e.g. the
+    // Rhine-Ruhr area around Cologne) where a village-inclusive query over a
+    // 100km+ radius can return well over a thousand nodes and risks a slow
+    // response or timeout even with the raised client timeout above. Only
+    // broadens to villages if the city/town result alone is thin — keeping
+    // sparse-area coverage without paying the cost everywhere else.
+    async function fetchCitiesByPopulation(lat, lon, minKm, maxKm, excludeName, rankingMode, maxResults = 50) {
+        if (isNaN(lat) || isNaN(lon)) {
+            console.error('[TM-Obfuscate] fetchCitiesByPopulation called with a non-numeric origin (lat=%s, lon=%s) — refusing to query Overpass with garbage coordinates', lat, lon);
+            return [];
+        }
+        let radiusM = Math.round(maxKm * 1000);
+        let effectiveMinKm = Math.max(minKm, 2);
+
+        let cityTownQuery = `[out:json][timeout:25];node(around:${radiusM},${lat},${lon})["place"~"^(city|town)$"]["population"];out body;`;
+        let elements = await queryOverpassRaw(cityTownQuery);
+        let rawCities = (elements || []).map(elementToCity).filter(isUsableCity);
+
+        let inRangeCount = rawCities.filter(c => {
+            let d = haversineKm(lat, lon, c.lat, c.lon);
+            return d >= effectiveMinKm && d <= maxKm;
+        }).length;
+
+        if (inRangeCount < 5) {
+            console.log('[TM-Obfuscate] city/town-only query found only %s in range — broadening to include villages', inRangeCount);
+            let villageQuery = `[out:json][timeout:25];node(around:${radiusM},${lat},${lon})["place"="village"]["population"];out body;`;
+            let villageElements = await queryOverpassRaw(villageQuery);
+            if (villageElements) {
+                rawCities = rawCities.concat(villageElements.map(elementToCity).filter(isUsableCity));
+            }
+        }
+
+        // Hard safety floor: never treat anything closer than 2km as a
+        // valid "nearby" pick, regardless of how low minKm is configured.
+        // This exists because the postcode's geocoded centroid and OSM's
+        // node for that SAME city are rarely at the exact same point —
+        // without this, the real origin city can slip through a low/zero
+        // minKm and get picked as an "obfuscated" result, defeating the
+        // whole point.
+        let cities = rawCities
+            .map(c => ({ ...c, distanceKm: haversineKm(lat, lon, c.lat, c.lon) }))
+            .filter(c => c.distanceKm >= effectiveMinKm && c.distanceKm <= maxKm);
+
+        // Belt-and-suspenders: also exclude an EXACT name match with the
+        // origin's own place, in case it's just far enough away (by the
+        // centroid/node mismatch the 2km floor above guards against) to
+        // pass the distance filter anyway. Deliberately NOT a substring
+        // match — that previously excluded genuinely distinct towns that
+        // merely share a name fragment with the origin (e.g. "Homburg" is a
+        // real, different city from "Bad Homburg"), which could wipe out
+        // the whole candidate list and force a fallback for the wrong
+        // reason.
+        if (excludeName) {
+            let target = normalizeNameForCompare(excludeName);
+            if (target) {
+                cities = cities.filter(c => normalizeNameForCompare(c.name) !== target);
+            }
+        }
+
+        // OSM sometimes has more than one node for the same place (e.g. a
+        // city plus a separately-tagged district sharing its name) — keep
+        // only the highest-population entry per name so the same place
+        // can't occupy two different ranks.
+        let byName = new Map();
+        for (let c of cities) {
+            let k = c.name.toLowerCase();
+            if (!byName.has(k) || byName.get(k).population < c.population) byName.set(k, c);
+        }
+        cities = Array.from(byName.values());
+
+        // Score by the selected ranking mode. "population" (default)
+        // preserves the original largest-first behavior; the other two fold
+        // proximity in so a much-closer mid-sized town can outrank a huge
+        // city sitting near the edge of the radius.
+        let scoreFn;
+        if (rankingMode === 'pop_per_dist') {
+            scoreFn = c => c.population / Math.max(c.distanceKm, 0.1);
+        } else if (rankingMode === 'pop_per_dist2') {
+            scoreFn = c => c.population / Math.max(c.distanceKm * c.distanceKm, 0.01);
+        } else {
+            scoreFn = c => c.population;
+        }
+        cities.sort((a, b) => scoreFn(b) - scoreFn(a));
+        console.log('[TM-Obfuscate] after distance+name filtering: %s candidates remain, ranked by %s (top 5: %j)', cities.length, rankingMode || 'population', cities.slice(0, 5).map(c => `${c.name}(pop=${c.population}, dist=${c.distanceKm.toFixed(1)}km, score=${scoreFn(c).toFixed(1)})`));
+
+        return cities.slice(0, maxResults);
+    }
+
+    // --- Per-Origin City Walk State ---
+    // Keyed by the real postcode being obfuscated, so loading vs. delivery —
+    // and different offers — each walk their own independently-fetched,
+    // population-sorted city list. `nextIndex` is the city this origin will
+    // hand out NEXT; once the list is exhausted it wraps back to the largest.
+    let cityWalkState = {};
+
+    // Resolves a single Overpass city node to a full "[Country Code]
+    // [postcode] [city]" place via Nominatim (reusing the existing
+    // rate-limit-safe, retrying reverseGeocode). Falls back to the Overpass
+    // node's own name if Nominatim's reverse lookup doesn't return one.
+    async function resolveCityPlace(city) {
+        let place = await reverseGeocode(city.lat, city.lon);
+        if (!place) return null;
+
+        // zoom=14 (suburb/quarter level) sometimes lands on a feature with
+        // no postcode tag at all in OSM. A closer, building-level lookup at
+        // the exact same coordinate occasionally finds one even when the
+        // broader area-level query didn't — worth one extra (throttled)
+        // call rather than just shipping an address with no postcode.
+        if (!place.postcode) {
+            console.log('[TM-Obfuscate] no postcode at zoom=14 for %s — retrying at zoom=18', city.name);
+            let finer = await reverseGeocode(city.lat, city.lon, 18);
+            if (finer && finer.postcode) place.postcode = finer.postcode;
+        }
+
+        // Always use the Overpass-ranked city's own name, not whatever
+        // Nominatim's reverse lookup resolves at that exact coordinate — at
+        // city-level precision that can land on a suburb, district, or other
+        // nearby named feature instead of the place we actually picked,
+        // which made the walk look out of order even when it wasn't.
+        // Nominatim is only trusted here for country code + postcode.
+        place.city = city.name;
+        return place;
+    }
+
+    // Kicks off resolving whatever city is up next, in the background,
+    // without blocking the caller — this is the "look for next city AFTER
+    // the content is copied" step. A no-op if a prefetch is already done or
+    // already in flight, so it's safe to call defensively.
+    function schedulePrefetch(state) {
+        if (!state || !state.cities.length) return;
+        if (state.prefetched || state.prefetchInFlight) return;
+        let idx = state.nextIndex;
+        let city = state.cities[idx % state.cities.length];
+        state.prefetchInFlight = resolveCityPlace(city)
+            .then(place => {
+                state.prefetched = { index: idx, place };
+                state.prefetchInFlight = null;
+                return place;
+            })
+            .catch(() => { state.prefetchInFlight = null; });
+    }
+
+    // Called once per copy (after the clipboard write) for each obfuscated
+    // end, so the NEXT city is already resolving while the user reads/pastes
+    // what they just copied — by the time they click again, it's usually
+    // already there waiting, with zero perceived wait.
+    function ensureObfuscationPrefetch(stop) {
+        if (!stop) return;
+        let cc = (stop.country || '').trim();
+        let parts = splitPostcodeAndCity(stop.city);
+        let geoLookupKey = parts.postcode ? postcodeForGeocode(parts.postcode) : parts.cityName;
+        if (!cc || !geoLookupKey) return;
+        let state = cityWalkState[`${cc.toUpperCase()}:${geoLookupKey}`];
+        schedulePrefetch(state);
+    }
+
+    async function getObfuscatedNearbyPlace(stop, maxResults = 50) {
+        try {
+            let oc = config.posting.locationObfuscation;
+            let cc = (stop.country || '').trim();
+            let originParts = splitPostcodeAndCity(stop.city);
+            let hasPostcode = !!originParts.postcode;
+            let geoLookupKey = hasPostcode ? postcodeForGeocode(originParts.postcode) : originParts.cityName;
+            console.log('[TM-Obfuscate] resolving stop: country=%s rawCity=%j -> hasPostcode=%s geoLookupKey=%j', cc, stop.city, hasPostcode, geoLookupKey);
+            if (!cc || !geoLookupKey) { console.warn('[TM-Obfuscate] missing country or geoLookupKey — cannot proceed, falling back'); return null; }
+
+            let key = `${cc.toUpperCase()}:${geoLookupKey}`;
+            let state = cityWalkState[key];
+
+            if (!state) {
+                // Initial lookup for this real address: nothing cached yet,
+                // so this is the one case allowed to resolve before copying.
+                // Addresses with an actual postcode go through Zippopotam;
+                // addresses with only a city name (no postcode at all) go
+                // through Nominatim's forward search instead — Zippopotam
+                // has no concept of looking something up by name.
+                console.log('[TM-Obfuscate] no cached city list for key=%s — doing initial lookup via %s', key, hasPostcode ? 'Zippopotam (postcode)' : 'Nominatim search (city name)');
+                let origin = hasPostcode
+                    ? await geocodePostcode(cc, geoLookupKey)
+                    : await geocodeCityName(cc, cleanCityNameForSearch(geoLookupKey));
+
+                // Zippopotam doesn't recognize every postcode it's handed —
+                // e.g. Portugal's real format is "NNNN-NNN" and TimoCom may
+                // only show the truncated "NNNN" part, which 404s; the UK's
+                // alphanumeric postcodes aren't in Zippopotam's coverage at
+                // all. Rather than give up, fall back to a name-based search
+                // if we have a city name to try.
+                if (!origin && hasPostcode && originParts.cityName) {
+                    let cleanName = cleanCityNameForSearch(originParts.cityName);
+                    console.log('[TM-Obfuscate] postcode lookup failed — retrying by city name "%s" instead', cleanName);
+                    origin = await geocodeCityName(cc, cleanName);
+                }
+
+                console.log('[TM-Obfuscate] origin coordinates:', origin);
+                if (!origin) { console.warn('[TM-Obfuscate] FAILED to geocode the origin address itself — falling back to real address. Check the network tab for the zippopotam/nominatim request.'); return null; }
+
+                let minKm = Math.min(oc.minKm, oc.maxKm);
+                let maxKm = Math.max(oc.minKm, oc.maxKm);
+                let cities = await fetchCitiesByPopulation(origin.lat, origin.lon, minKm, maxKm, cleanCityNameForSearch(originParts.cityName), oc.rankingMode, maxResults);
+                console.log('[TM-Obfuscate] candidate cities found within %s-%skm: %s', minKm, maxKm, cities.length, cities.slice(0, 10));
+                if (!cities.length) { console.warn('[TM-Obfuscate] Overpass returned ZERO usable candidate cities — falling back to real address. Either the area genuinely has no OSM population data in range, or the Overpass request itself failed (check Network tab for overpass-api.de).'); return null; }
+
+                state = { cities, nextIndex: 0, prefetched: null, prefetchInFlight: null };
+                cityWalkState[key] = state;
+
+                let place = await resolveCityPlace(cities[0]);
+                console.log('[TM-Obfuscate] resolved first (largest) city ->', place);
+                state.nextIndex = 1 % cities.length;
+                return place;
+            }
+
+            if (!state.cities.length) { console.warn('[TM-Obfuscate] cached state has an empty city list for key=%s — falling back', key); return null; }
+
+            // Largest-first walk: use whatever was already prefetched after
+            // the previous copy (the common, instant case); if the user
+            // clicked faster than the prefetch finished, fall back to
+            // resolving right now instead of returning nothing.
+            if (state.prefetched && state.prefetched.index === state.nextIndex) {
+                let place = state.prefetched.place;
+                console.log('[TM-Obfuscate] using prefetched city (instant) ->', place);
+                state.prefetched = null;
+                state.nextIndex = (state.nextIndex + 1) % state.cities.length;
+                return place;
+            }
+            if (state.prefetchInFlight) {
+                console.log('[TM-Obfuscate] prefetch was still in flight — awaiting it now');
+                let place = await state.prefetchInFlight;
+                console.log('[TM-Obfuscate] awaited in-flight prefetch ->', place);
+                state.prefetched = null;
+                state.prefetchInFlight = null;
+                state.nextIndex = (state.nextIndex + 1) % state.cities.length;
+                return place;
+            }
+
+            console.log('[TM-Obfuscate] no prefetch ready at all — resolving city at index %s right now', state.nextIndex);
+            let city = state.cities[state.nextIndex % state.cities.length];
+            let place = await resolveCityPlace(city);
+            console.log('[TM-Obfuscate] resolved ->', place);
+            state.nextIndex = (state.nextIndex + 1) % state.cities.length;
+            return place;
+        } catch (e) {
+            console.error('[TM-Obfuscate] EXCEPTION in getObfuscatedNearbyPlace — this was previously silently swallowed:', e);
+            return null;
+        }
+    }
+
+    // --- Posting Export: Loading/Delivery Address Builder ---
+    // Produces "[Country Code] [postcode] [city]" for the loading stop and
+    // (when there's a genuinely different stop) the delivery stop. Each end's
+    // obfuscation lookup runs concurrently; a single-stop load simply has no
+    // delivery address (the line gets omitted).
+    async function buildPostingAddresses(stops) {
+        let oc = config.posting.locationObfuscation;
+        let loadingStop = stops.length ? stops[0] : null;
+        let deliveryStop = stops.length > 1 ? stops[stops.length - 1] : null;
+
+        let loadingLookup = (oc.obfuscateLoading && loadingStop)
+            ? getObfuscatedNearbyPlace(loadingStop, 5)
+            : Promise.resolve(null);
+        let deliveryLookup = (oc.obfuscateDelivery && deliveryStop)
+            ? getObfuscatedNearbyPlace(deliveryStop, 1)
+            : Promise.resolve(null);
+
+        let [altLoadingPlace, altDeliveryPlace] = await Promise.all([loadingLookup, deliveryLookup]);
+        if (oc.obfuscateLoading) console.log('[TM-Obfuscate] loading result: %s', altLoadingPlace ? 'OBFUSCATED -> ' + JSON.stringify(altLoadingPlace) : 'FELL BACK to real address');
+        if (oc.obfuscateDelivery) console.log('[TM-Obfuscate] delivery result: %s', altDeliveryPlace ? 'OBFUSCATED -> ' + JSON.stringify(altDeliveryPlace) : 'FELL BACK to real address');
+
+        let loadingAddress = altLoadingPlace ? buildAddressLineFromPlace(altLoadingPlace) : buildAddressLine(loadingStop);
+        let deliveryAddress = altDeliveryPlace ? buildAddressLineFromPlace(altDeliveryPlace) : buildAddressLine(deliveryStop);
+
+        return { loadingAddress, deliveryAddress };
+    }
+
+    // --- Template Compiler Engine ---
+    function generateFormattedTemplate(targetUrl) {
+        let stops = collectStops();
+        let first = stops.length ? stops[0] : {};
+        let last = stops.length ? stops[stops.length - 1] : {};
+
+        // First loading stop -> "Loading"; last stop -> "Delivery"
+        let dateRangeFirst = mergeRange(first.eDate, first.lDate, "27.05");
+        let dateRangeLast = mergeRange(last.eDate, last.lDate, "28.05");
+
+        let rawTimeFirst = first.lTime || first.eTime || "12:00";
+        let rawTimeLast = last.lTime || last.eTime || "13:00";
+
+        let finalTimeFirst = offsetTimeStr(rawTimeFirst, config.offsetLoad);
+        let finalTimeLast = offsetTimeStr(rawTimeLast, config.offsetDel);
+
+        let ldm = extractDigits(getTextByTestId('FreightDescriptionView/freightLength')) || "3";
+        let wt = extractDigits(getTextByTestId('FreightDescriptionView/freightWeight')) || "0.65";
+
+        let desc = getTextByTestId('FreightDescriptionView/typeOfGoods');
+        let addInfo = getTextByTestId('FreightDescriptionView/additionalInformation');
+        let remarks = getTextByTestId('RemarksView/external-remarks');
+        let combinedText = `${desc} ${addInfo} ${remarks}`;
+
+        let lines = [];
+
+        if (config.prefixText) lines.push(config.prefixText);
+        if (config.showRoute) lines.push(`Route: ${targetUrl || "Generating map route..."}`);
+        if (config.showLoading) lines.push(`Loading: ${dateRangeFirst} ${finalTimeFirst}`);
+        if (config.showDelivery) lines.push(`Delivery: ${dateRangeLast} ${finalTimeLast}`);
+        if (config.showDims) lines.push(`LDM/ Wt: ${ldm}m ${wt}t`);
+
+        if (config.showNote && /lift|adr|pallet|plt|pal|epal/i.test(combinedText)) {
+            let noteContent = desc || addInfo || remarks || "LIFT/ADR/Pallets";
+            lines.push(`Note: ${noteContent}`);
+        }
+
+        if (config.suffixText) lines.push(config.suffixText);
+
+        return lines.join('\n');
+    }
+
+    // --- Posting Export: Template Compiler ---
+    // Independent from generateFormattedTemplate above: own field toggles, own
+    // hour offsets, randomized LDM/weight, keyword-only notes, and the two
+    // static tag lines (Typ nadwozia / Wielkość pojazdu).
+    // --- Posting Export: Shared Line Builder ---
+    // All the field-toggle / label / jitter / notes / tag logic lives here,
+    // fed by a plain data object — so the live-DOM flow and the "paste
+    // freight info" flow produce byte-identical output from the same inputs.
+    function buildPostingLines(data) {
+        let pc = config.posting;
+
+        let finalTimeFirst = offsetTimeStr(data.timeFirst, pc.offsetLoad);
+        let finalTimeLast = offsetTimeStr(data.timeLast, pc.offsetDel);
+        let dims = jitterDims(data.ldmRaw, data.wtRaw);
+        let notesStr = extractNotesKeywords(data.notesText);
+
+        let lines = [];
+
+        if (pc.showLoadingAddress && data.loadingAddress) lines.push(withLabel(pc.labels.loadingAddress, data.loadingAddress));
+        if (pc.showDeliveryAddress && data.deliveryAddress) lines.push(withLabel(pc.labels.deliveryAddress, data.deliveryAddress));
+
+        let loadingVal = `${slashDate(data.dateRangeFirst)} ${finalTimeFirst}`.trim();
+        if (pc.showLoading && loadingVal) lines.push(withLabel(pc.labels.loading, loadingVal));
+
+        let deliveryVal = `${slashDate(data.dateRangeLast)} ${finalTimeLast}`.trim();
+        if (pc.showDelivery && deliveryVal) lines.push(withLabel(pc.labels.delivery, deliveryVal));
+
+        if (pc.showDims) lines.push(withLabel(pc.labels.dims, `${dims.ldm}m ${dims.wt}t`));
+        if (pc.showNotes && notesStr) lines.push(withLabel(pc.labels.notes, notesStr));
+
+        if (pc.showBodyType) {
+            let sel = (pc.bodyTypeTags || []).filter(t => t.enabled).map(t => t.text);
+            if (sel.length) lines.push(withLabel(pc.labels.bodyType, sel.join('; ')));
+        }
+        if (pc.showVehicleSize) {
+            let sel = (pc.vehicleSizeTags || []).filter(t => t.enabled).map(t => t.text);
+            if (sel.length) lines.push(withLabel(pc.labels.vehicleSize, sel.join('; ')));
+        }
+
+        return lines.join('\n');
+    }
+
+    // --- Posting Export: Template Compiler (live DOM source) ---
+    function generatePostingTemplate(addresses) {
+        let stops = collectStops();
+        let first = stops.length ? stops[0] : {};
+        let last = stops.length ? stops[stops.length - 1] : {};
+
+        let ldmRaw = extractDigits(getTextByTestId('FreightDescriptionView/freightLength')) || "3";
+        let wtRaw = extractDigits(getTextByTestId('FreightDescriptionView/freightWeight')) || "0.65";
+
+        let desc = getTextByTestId('FreightDescriptionView/typeOfGoods');
+        let addInfo = getTextByTestId('FreightDescriptionView/additionalInformation');
+        let remarks = getTextByTestId('RemarksView/external-remarks');
+
+        return buildPostingLines({
+            loadingAddress: addresses.loadingAddress,
+            deliveryAddress: addresses.deliveryAddress,
+            dateRangeFirst: mergeRange(first.eDate, first.lDate, "27.05"),
+            dateRangeLast: mergeRange(last.eDate, last.lDate, "28.05"),
+            timeFirst: first.lTime || first.eTime || "12:00",
+            timeLast: last.lTime || last.eTime || "13:00",
+            ldmRaw,
+            wtRaw,
+            notesText: `${desc} ${addInfo} ${remarks}`
+        });
+    }
+
+    // --- Posting Export: Template Compiler (pasted-text source) ---
+    // Same shared builder, fed by whatever parsePastedFreightText() managed
+    // to pull out of arbitrary pasted text instead of the page DOM.
+    function generatePostingTemplateFromStops(stops, addresses, ldmRaw, wtRaw, notesText) {
+        let first = stops.length ? stops[0] : {};
+        let last = stops.length ? stops[stops.length - 1] : {};
+
+        return buildPostingLines({
+            loadingAddress: addresses.loadingAddress,
+            deliveryAddress: addresses.deliveryAddress,
+            dateRangeFirst: mergeRange(first.eDate, first.lDate, ""),
+            dateRangeLast: mergeRange(last.eDate, last.lDate, ""),
+            timeFirst: first.lTime || first.eTime || "",
+            timeLast: last.lTime || last.eTime || "",
+            ldmRaw: ldmRaw || "3",
+            wtRaw: wtRaw || "0.65",
+            notesText: notesText || ""
+        });
+    }
+
+    function executeUnifiedCopy() {
+        if (!currentOfferId || currentShortUrl === "Shortening link...") return;
+
+        try {
+            const finalOutput = generateFormattedTemplate(currentShortUrl);
+            GM_setClipboard(finalOutput, "text");
+
+            const actionBtn = shadowRoot.getElementById('tm-cargo-action-btn');
+            const statusText = shadowRoot.getElementById('tm-cargo-status-text');
+
+            const baseBtnText = actionBtn.innerText;
+            const baseBtnBg = actionBtn.style.backgroundColor;
+            const baseBoxBg = statusText.style.backgroundColor;
+            const baseBoxBorder = statusText.style.borderColor;
+
+            actionBtn.innerText = '✅ Copied!';
+            actionBtn.style.backgroundColor = '#16a34a';
+            statusText.style.backgroundColor = '#f0fdf4';
+            statusText.style.borderColor = '#16a34a';
+
+            setTimeout(() => {
+                actionBtn.innerText = baseBtnText;
+                actionBtn.style.backgroundColor = baseBtnBg;
+                statusText.style.backgroundColor = baseBoxBg;
+                statusText.style.borderColor = baseBoxBorder;
+            }, 1800);
+
+        } catch (err) {
+            console.error("Clipboard failure:", err);
+        }
+    }
+
+    // --- Codes + Postcodes Copy Handler ---
+    // Same export template, but the Route line carries the country-code/postcode
+    // lane (all stops) instead of the shortened map link.
+    function executeCodesCopy() {
+        if (!currentOfferId) return;
+
+        try {
+            const stops = collectStops();
+            const codesRoute = buildCodesRoute(stops);
+            const finalOutput = generateFormattedTemplate(codesRoute);
+            GM_setClipboard(finalOutput, "text");
+
+            const codesBtn = shadowRoot.getElementById('tm-cargo-codes-btn');
+            if (!codesBtn) return;
+
+            const baseText = codesBtn.innerText;
+            const baseBg = codesBtn.style.backgroundColor;
+            codesBtn.innerText = '✅ Copied!';
+            codesBtn.style.backgroundColor = '#16a34a';
+            setTimeout(() => {
+                codesBtn.innerText = baseText;
+                codesBtn.style.backgroundColor = baseBg;
+            }, 1800);
+
+        } catch (err) {
+            console.error("Codes clipboard failure:", err);
+        }
+    }
+
+    // --- "Organise for Posting" Copy Handler ---
+    // Builds the independent Posting template (own field toggles, hour
+    // offsets, randomized LDM/weight, keyword notes, body-type/vehicle tags)
+    // and copies it to the clipboard, ready to paste on another site.
+    async function executePostingCopy() {
+        if (!currentOfferId) return;
+
+        const postBtn = shadowRoot.getElementById('tm-cargo-post-btn');
+        const oc = config.posting.locationObfuscation;
+        const obfuscating = oc.obfuscateLoading || oc.obfuscateDelivery;
+        console.log('[TM-Obfuscate] click. obfuscateLoading=%s obfuscateDelivery=%s minKm=%s maxKm=%s', oc.obfuscateLoading, oc.obfuscateDelivery, oc.minKm, oc.maxKm);
+
+        try {
+            const stops = collectStops();
+            console.log('[TM-Obfuscate] stops:', JSON.parse(JSON.stringify(stops)));
+
+            if (postBtn && obfuscating) {
+                postBtn.innerText = '⏳ Finding nearby city...';
+                postBtn.style.pointerEvents = 'none';
+            }
+
+            const addresses = await buildPostingAddresses(stops);
+            console.log('[TM-Obfuscate] final addresses used:', addresses);
+            const finalOutput = generatePostingTemplate(addresses);
+            GM_setClipboard(finalOutput, "text");
+
+            // Now that this round's pick is locked in and copied, start
+            // resolving the NEXT city in the background for whichever ends
+            // are obfuscated — ready before the user clicks again.
+            if (oc.obfuscateLoading) ensureObfuscationPrefetch(stops[0]);
+            if (oc.obfuscateDelivery && stops.length > 1) ensureObfuscationPrefetch(stops[stops.length - 1]);
+
+            if (!postBtn) return;
+
+            const baseBg = postBtn.style.backgroundColor;
+            postBtn.innerText = '✅ Copied!';
+            postBtn.style.backgroundColor = '#16a34a';
+            postBtn.style.pointerEvents = 'auto';
+            setTimeout(() => {
+                postBtn.innerText = POST_BTN_DEFAULT_TEXT;
+                postBtn.style.backgroundColor = baseBg;
+            }, 1800);
+
+        } catch (err) {
+            console.error("Posting clipboard failure:", err);
+            if (postBtn) {
+                postBtn.innerText = POST_BTN_DEFAULT_TEXT;
+                postBtn.style.pointerEvents = 'auto';
+            }
+        }
+    }
+
+    // --- Initialize Zero-Impact Shadow DOM Host ---
+    function initShadowDOM() {
+        if (!document.getElementById('tm-cargo-host-wrapper')) {
+            const wrapper = document.createElement('div');
+            wrapper.id = 'tm-cargo-host-wrapper';
+            // Physically remove the wrapper from the document flow completely
+            wrapper.style.position = 'fixed';
+            wrapper.style.top = '0';
+            wrapper.style.left = '0';
+            wrapper.style.width = '0px';
+            wrapper.style.height = '0px';
+            wrapper.style.overflow = 'visible';
+            wrapper.style.zIndex = '2147483647';
+            wrapper.style.pointerEvents = 'none'; // Prevent wrapper from stealing clicks
+            document.body.appendChild(wrapper);
+            shadowRoot = wrapper.attachShadow({ mode: 'open' });
+        }
+    }
+
+    // --- Settings Modal UI Builder (Inside Shadow DOM) ---
+    function openSettingsModal() {
+        if (shadowRoot.getElementById('tm-cfg-modal')) return;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'tm-cfg-modal';
+        overlay.style.position = 'fixed';
+        overlay.style.top = '0'; overlay.style.left = '0';
+        overlay.style.width = '100vw'; overlay.style.height = '100vh';
+        overlay.style.backgroundColor = 'rgba(0,0,0,0.5)';
+        overlay.style.display = 'flex';
+        overlay.style.justifyContent = 'center';
+        overlay.style.alignItems = 'center';
+        overlay.style.fontFamily = 'Segoe UI, system-ui, sans-serif';
+        overlay.style.zIndex = '9999';
+        overlay.style.pointerEvents = 'auto'; // Re-enable pointer events for the UI
+
+        const modal = document.createElement('div');
+        modal.style.backgroundColor = '#fff';
+        modal.style.borderRadius = '8px';
+        modal.style.width = '350px';
+        modal.style.padding = '20px';
+        modal.style.boxShadow = '0 10px 25px rgba(0,0,0,0.2)';
+        modal.style.boxSizing = 'border-box';
+
+        modal.innerHTML = `
+            <h3 style="margin-top:0; color:#0f172a; font-size: 16px;">⚙️ Export Configuration</h3>
+
+            <div style="margin-bottom: 15px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">Toggle Fields</label>
+                <div style="display:flex; flex-direction:column; gap:6px; margin-top:5px; font-size:13px; color:#000;">
+                    <label><input type="checkbox" id="cfg-route" ${config.showRoute ? 'checked' : ''}> Map Route</label>
+                    <label><input type="checkbox" id="cfg-load" ${config.showLoading ? 'checked' : ''}> Loading Date/Time</label>
+                    <label><input type="checkbox" id="cfg-del" ${config.showDelivery ? 'checked' : ''}> Delivery Date/Time</label>
+                    <label><input type="checkbox" id="cfg-dims" ${config.showDims ? 'checked' : ''}> LDM / Weight</label>
+                    <label><input type="checkbox" id="cfg-note" ${config.showNote ? 'checked' : ''}> Conditional Note</label>
+                </div>
+            </div>
+
+            <div style="margin-bottom: 15px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">Time Offsets (Hours)</label>
+                <div style="display:flex; justify-content:space-between; margin-top:5px; font-size:13px; color:#000;">
+                    <div>Loading: <input type="number" id="cfg-off-load" value="${config.offsetLoad}" style="width:40px; text-align:center;"></div>
+                    <div>Delivery: <input type="number" id="cfg-off-del" value="${config.offsetDel}" style="width:40px; text-align:center;"></div>
+                </div>
+            </div>
+
+            <div style="margin-bottom: 10px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">Custom Prefix Text</label>
+                <textarea id="cfg-prefix" style="width:100%; height:40px; font-size:12px; resize:none; box-sizing:border-box;" placeholder="Text to add before export...">${config.prefixText}</textarea>
+            </div>
+
+            <div style="margin-bottom: 15px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">Custom Suffix Text</label>
+                <textarea id="cfg-suffix" style="width:100%; height:40px; font-size:12px; resize:none; box-sizing:border-box;" placeholder="Text to add after export...">${config.suffixText}</textarea>
+            </div>
+
+            <div style="display:flex; justify-content:flex-end; gap:10px;">
+                <button id="cfg-cancel" style="padding:6px 12px; border:none; background:#e2e8f0; border-radius:4px; cursor:pointer; color:#000;">Cancel</button>
+                <button id="cfg-save" style="padding:6px 12px; border:none; background:#0284c7; color:#fff; border-radius:4px; font-weight:bold; cursor:pointer;">Save Config</button>
+            </div>
+        `;
+
+        overlay.appendChild(modal);
+        shadowRoot.appendChild(overlay);
+
+        shadowRoot.getElementById('cfg-cancel').onclick = () => overlay.remove();
+        shadowRoot.getElementById('cfg-save').onclick = () => {
+            config.showRoute = shadowRoot.getElementById('cfg-route').checked;
+            config.showLoading = shadowRoot.getElementById('cfg-load').checked;
+            config.showDelivery = shadowRoot.getElementById('cfg-del').checked;
+            config.showDims = shadowRoot.getElementById('cfg-dims').checked;
+            config.showNote = shadowRoot.getElementById('cfg-note').checked;
+            config.offsetLoad = parseInt(shadowRoot.getElementById('cfg-off-load').value || '0', 10);
+            config.offsetDel = parseInt(shadowRoot.getElementById('cfg-off-del').value || '0', 10);
+            config.prefixText = shadowRoot.getElementById('cfg-prefix').value;
+            config.suffixText = shadowRoot.getElementById('cfg-suffix').value;
+
+            saveConfig();
+            overlay.remove();
+
+            if (currentOfferId && currentShortUrl) {
+                shadowRoot.getElementById('tm-cargo-status-text').innerText = generateFormattedTemplate(currentShortUrl);
+            }
+        };
+    }
+
+    // --- "Paste Freight Info" Modal (Inside Shadow DOM) ---
+    // Lets the Posting export run on freight info pasted from anywhere (e.g.
+    // this script's own "Copy Short Route Template" output, or a different
+    // tab), instead of requiring a freight offer to be selected on the page.
+    // Runs through the exact same pipeline as the live-DOM button — jitter,
+    // tags, labels, location obfuscation all apply identically.
+    function openPasteModal() {
+        if (shadowRoot.getElementById('tm-paste-modal')) return;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'tm-paste-modal';
+        overlay.style.position = 'fixed';
+        overlay.style.top = '0'; overlay.style.left = '0';
+        overlay.style.width = '100vw'; overlay.style.height = '100vh';
+        overlay.style.backgroundColor = 'rgba(0,0,0,0.5)';
+        overlay.style.display = 'flex';
+        overlay.style.justifyContent = 'center';
+        overlay.style.alignItems = 'center';
+        overlay.style.fontFamily = 'Segoe UI, system-ui, sans-serif';
+        overlay.style.zIndex = '2147483647';
+        overlay.style.pointerEvents = 'auto';
+
+        const modal = document.createElement('div');
+        modal.style.backgroundColor = '#fff';
+        modal.style.borderRadius = '8px';
+        modal.style.width = '420px';
+        modal.style.padding = '20px';
+        modal.style.boxShadow = '0 10px 25px rgba(0,0,0,0.2)';
+        modal.style.boxSizing = 'border-box';
+
+        modal.innerHTML = `
+            <h3 style="margin-top:0; color:#0f172a; font-size:16px;">📥 Paste Freight Info</h3>
+            <div style="font-size:11px; color:#64748b; margin-bottom:8px;">Paste freight info from anywhere — works without a freight offer selected on the page. Runs through the same Posting export: randomization, tags, labels, and location obfuscation all still apply.</div>
+            <textarea id="paste-input" style="width:100%; height:140px; font-size:12px; box-sizing:border-box; padding:8px; font-family:monospace; color:#000;" placeholder="Loading address: NL 7511 Enschede&#10;Delivery address: ES 14009 Cordoba&#10;Loading: 22.06 - 23.06 15:00&#10;Delivery: 25.06 15:00&#10;LDM/ Wt: 4.4m 2t&#10;Note: ADR, LIFT"></textarea>
+            <div id="paste-error" style="font-size:11px; color:#dc2626; margin-top:6px; display:none;"></div>
+            <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:14px;">
+                <button id="paste-cancel" style="padding:6px 12px; border:none; background:#e2e8f0; border-radius:4px; cursor:pointer; color:#000;">Cancel</button>
+                <button id="paste-process" style="padding:6px 12px; border:none; background:#ea580c; color:#fff; border-radius:4px; font-weight:bold; cursor:pointer;">Process &amp; Copy</button>
+            </div>
+        `;
+
+        overlay.appendChild(modal);
+        shadowRoot.appendChild(overlay);
+
+        const textarea = shadowRoot.getElementById('paste-input');
+        const errorBox = shadowRoot.getElementById('paste-error');
+        const processBtn = shadowRoot.getElementById('paste-process');
+        const cancelBtn = shadowRoot.getElementById('paste-cancel');
+        const baseProcessText = processBtn.innerText;
+        textarea.focus();
+
+        cancelBtn.onclick = () => overlay.remove();
+
+        processBtn.onclick = async () => {
+            errorBox.style.display = 'none';
+
+            let parsed = parsePastedFreightText(textarea.value);
+            if (!parsed) {
+                errorBox.textContent = "Couldn't find any recognizable freight info in that text — need at least a country/postcode, a date, or an LDM/weight value.";
+                errorBox.style.display = 'block';
+                return;
+            }
+
+            const oc = config.posting.locationObfuscation;
+            processBtn.style.pointerEvents = 'none';
+            if (oc.obfuscateLoading || oc.obfuscateDelivery) {
+                processBtn.innerText = '⏳ Finding nearby city...';
+            }
+
+            try {
+                let addresses = await buildPostingAddresses(parsed.stops);
+                let finalOutput = generatePostingTemplateFromStops(parsed.stops, addresses, parsed.ldmRaw, parsed.wtRaw, parsed.notesText);
+                GM_setClipboard(finalOutput, "text");
+
+                if (oc.obfuscateLoading) ensureObfuscationPrefetch(parsed.stops[0]);
+                if (oc.obfuscateDelivery && parsed.stops.length > 1) ensureObfuscationPrefetch(parsed.stops[parsed.stops.length - 1]);
+
+                processBtn.innerText = '✅ Copied!';
+                processBtn.style.backgroundColor = '#16a34a';
+                setTimeout(() => overlay.remove(), 900);
+            } catch (err) {
+                console.error("Paste-and-organise failure:", err);
+                errorBox.textContent = "Something went wrong processing that text — please try again.";
+                errorBox.style.display = 'block';
+                processBtn.innerText = baseProcessText;
+                processBtn.style.pointerEvents = 'auto';
+            }
+        };
+    }
+
+    // --- Posting Settings Panel: Reusable "Export Line" Row (checkbox + fixed description + editable label) ---
+    function lineRowHtml(checkboxId, fieldDesc, labelInputId, labelValue, checked) {
+        return `
+            <div style="display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" id="${checkboxId}" ${checked ? 'checked' : ''}>
+                <span style="width:78px; flex-shrink:0; color:#64748b; font-size:11px;">${fieldDesc}</span>
+                <input type="text" id="${labelInputId}" value="${labelValue}" placeholder="(no label)" style="flex:1; min-width:0; font-size:12px; box-sizing:border-box; padding:2px 4px;">
+            </div>
+        `;
+    }
+
+    // --- Posting Settings Panel: Editable Tag List (Typ nadwozia / Wielkość pojazdu) ---
+    // Built with plain DOM nodes (not innerHTML strings) so tag text never needs
+    // HTML-escaping and rows can be added/removed live without re-rendering the
+    // whole list (which would lose in-progress edits in other rows).
+    function buildTagRow(tag) {
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.gap = '6px';
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = tag.enabled !== false;
+        cb.dataset.role = 'enabled';
+        row.appendChild(cb);
+
+        const txt = document.createElement('input');
+        txt.type = 'text';
+        txt.value = tag.text || '';
+        txt.dataset.role = 'text';
+        txt.style.flex = '1';
+        txt.style.minWidth = '0';
+        txt.style.fontSize = '12px';
+        txt.style.boxSizing = 'border-box';
+        txt.style.padding = '2px 4px';
+        row.appendChild(txt);
+
+        const rm = document.createElement('span');
+        rm.innerHTML = '✖';
+        rm.title = 'Remove tag';
+        rm.style.cursor = 'pointer';
+        rm.style.color = '#dc2626';
+        rm.style.fontWeight = 'bold';
+        rm.style.padding = '0 4px';
+        rm.addEventListener('click', () => row.remove());
+        row.appendChild(rm);
+
+        return row;
+    }
+
+    function renderTagList(containerEl, tags) {
+        containerEl.innerHTML = '';
+        (tags || []).forEach(tag => containerEl.appendChild(buildTagRow(tag)));
+    }
+
+    // Rows with blank text are skipped (clearing the text field is the same as
+    // deleting the row, in case someone forgets to hit the ✖).
+    function readTagList(containerEl) {
+        let tags = [];
+        Array.from(containerEl.children).forEach(row => {
+            const txt = row.querySelector('input[data-role="text"]');
+            const cb = row.querySelector('input[data-role="enabled"]');
+            const text = txt ? txt.value.trim() : '';
+            if (text) tags.push({ text: text, enabled: cb ? cb.checked : true });
+        });
+        return tags;
+    }
+
+    // --- Posting Settings Panel: Reusable 8-Field Jitter Band Block ---
+    function bandFieldsHtml(prefix, band, capLdmLabel, capWtLabel) {
+        return `
+            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap:6px; margin-top:6px; font-size:11px; color:#000;">
+                <div>LDM min<br><input type="number" step="0.1" id="${prefix}-ldm-min" value="${band.ldmMin}" style="width:100%; box-sizing:border-box;"></div>
+                <div>LDM max<br><input type="number" step="0.1" id="${prefix}-ldm-max" value="${band.ldmMax}" style="width:100%; box-sizing:border-box;"></div>
+                <div>LDM step<br><input type="number" step="0.1" id="${prefix}-ldm-step" value="${band.ldmStep}" style="width:100%; box-sizing:border-box;"></div>
+                <div>LDM cap${capLdmLabel}<br><input type="number" step="0.1" id="${prefix}-ldm-cap" value="${band.ldmCap}" style="width:100%; box-sizing:border-box;"></div>
+                <div>Wt min<br><input type="number" step="0.1" id="${prefix}-wt-min" value="${band.wtMin}" style="width:100%; box-sizing:border-box;"></div>
+                <div>Wt max<br><input type="number" step="0.1" id="${prefix}-wt-max" value="${band.wtMax}" style="width:100%; box-sizing:border-box;"></div>
+                <div>Wt step<br><input type="number" step="0.1" id="${prefix}-wt-step" value="${band.wtStep}" style="width:100%; box-sizing:border-box;"></div>
+                <div>Wt cap${capWtLabel}<br><input type="number" step="0.1" id="${prefix}-wt-cap" value="${band.wtCap}" style="width:100%; box-sizing:border-box;"></div>
+            </div>
+        `;
+    }
+
+    // --- Posting Settings Panel: Standalone Draggable Box (Inside Shadow DOM) ---
+    // Deliberately separate from openSettingsModal()/the gear-icon overlay above:
+    // its own panel, own drag mechanics, own position + open/closed persistence
+    // (tm-post-panel-left/top/open), independent of the main menu's state.
+    function buildPostingSettingsPanel() {
+        if (shadowRoot.getElementById('tm-post-settings-panel')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'tm-post-settings-panel';
+        panel.style.position = 'absolute';
+        panel.style.width = '380px';
+        panel.style.maxHeight = '82vh';
+        panel.style.backgroundColor = '#ffffff';
+        panel.style.border = '1px solid #cbd5e1';
+        panel.style.borderRadius = '8px';
+        panel.style.boxShadow = '0 10px 25px rgba(0,0,0,0.2)';
+        panel.style.fontFamily = 'Segoe UI, system-ui, -apple-system, sans-serif';
+        panel.style.flexDirection = 'column';
+        panel.style.overflow = 'hidden';
+        panel.style.boxSizing = 'border-box';
+        panel.style.pointerEvents = 'auto';
+        panel.style.zIndex = '2147483647';
+
+        const savedLeft = localStorage.getItem('tm-post-panel-left');
+        const savedTop = localStorage.getItem('tm-post-panel-top');
+        panel.style.left = savedLeft || '20px';
+        panel.style.top = savedTop || '120px';
+
+        const isOpen = localStorage.getItem('tm-post-panel-open') === 'true';
+        panel.style.display = isOpen ? 'flex' : 'none';
+
+        const header = document.createElement('div');
+        header.id = 'tm-post-settings-header';
+        header.style.backgroundColor = '#7c2d12';
+        header.style.color = '#ffffff';
+        header.style.padding = '12px 16px';
+        header.style.fontSize = '13px';
+        header.style.fontWeight = 'bold';
+        header.style.cursor = 'move';
+        header.style.userSelect = 'none';
+        header.style.display = 'flex';
+        header.style.justifyContent = 'space-between';
+        header.style.boxSizing = 'border-box';
+        header.style.flexShrink = '0';
+
+        const titleSpan = document.createElement('span');
+        titleSpan.innerHTML = '📦 Posting Export Settings';
+        header.appendChild(titleSpan);
+
+        const closeSpan = document.createElement('span');
+        closeSpan.innerHTML = '✖';
+        closeSpan.style.cursor = 'pointer';
+        closeSpan.title = 'Close';
+        closeSpan.onclick = (e) => {
+            e.stopPropagation();
+            panel.style.display = 'none';
+            localStorage.setItem('tm-post-panel-open', 'false');
+        };
+        header.appendChild(closeSpan);
+
+        panel.appendChild(header);
+
+        const body = document.createElement('div');
+        body.style.padding = '14px 16px';
+        body.style.overflowY = 'auto';
+        body.style.fontSize = '12px';
+        body.style.color = '#000';
+        body.style.boxSizing = 'border-box';
+
+        const pc = config.posting;
+
+        body.innerHTML = `
+            <div style="margin-bottom: 14px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">Export Lines (enable / disable, rename label)</label>
+                <div style="display:flex; flex-direction:column; gap:6px; margin-top:6px; font-size:13px; color:#000;">
+                    ${lineRowHtml('pcfg-loadaddr', 'Loading address', 'pcfg-label-loadaddr', pc.labels.loadingAddress, pc.showLoadingAddress)}
+                    ${lineRowHtml('pcfg-deladdr', 'Delivery address', 'pcfg-label-deladdr', pc.labels.deliveryAddress, pc.showDeliveryAddress)}
+                    ${lineRowHtml('pcfg-load', 'Loading', 'pcfg-label-load', pc.labels.loading, pc.showLoading)}
+                    ${lineRowHtml('pcfg-del', 'Delivery', 'pcfg-label-del', pc.labels.delivery, pc.showDelivery)}
+                    ${lineRowHtml('pcfg-dims', 'LDM / Wt', 'pcfg-label-dims', pc.labels.dims, pc.showDims)}
+                    ${lineRowHtml('pcfg-notes', 'Notes', 'pcfg-label-notes', pc.labels.notes, pc.showNotes)}
+                    ${lineRowHtml('pcfg-bodytype', 'Typ nadwozia', 'pcfg-label-bodytype', pc.labels.bodyType, pc.showBodyType)}
+                    ${lineRowHtml('pcfg-vehiclesize', 'Wielk. pojazdu', 'pcfg-label-vehiclesize', pc.labels.vehicleSize, pc.showVehicleSize)}
+                </div>
+                <div style="font-size:10px; color:#94a3b8; margin-top:4px;">Left column = fixed field. Right box = the label text printed before it (e.g. change to "vehicleSizeId"). Leave blank to print the value with no label.</div>
+            </div>
+
+            <div style="margin-bottom: 14px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">Location Obfuscation</label>
+                <div style="display:flex; flex-direction:column; gap:6px; margin-top:6px; font-size:13px; color:#000;">
+                    <label><input type="checkbox" id="pcfg-locobf-loading" ${pc.locationObfuscation.obfuscateLoading ? 'checked' : ''}> Replace loading code with a random nearby city</label>
+                    <label><input type="checkbox" id="pcfg-locobf-delivery" ${pc.locationObfuscation.obfuscateDelivery ? 'checked' : ''}> Replace delivery code with a random nearby city</label>
+                    <div style="display:flex; justify-content:space-between; gap:10px;">
+                        <div>Min km <input type="number" id="pcfg-locobf-min" value="${pc.locationObfuscation.minKm}" style="width:60px; text-align:center;"></div>
+                        <div>Max km <input type="number" id="pcfg-locobf-max" value="${pc.locationObfuscation.maxKm}" style="width:60px; text-align:center;"></div>
+                    </div>
+                </div>
+                <div style="font-size:10px; color:#94a3b8; margin-top:4px;">For each end you enable, finds real cities/towns within this range using OpenStreetMap (Overpass + Nominatim) and steps through them one new one per click, ranked by the strategy below. Works whether the source address has a postcode or just a city name. The real origin city is always excluded (by name and by a 2km minimum, regardless of how low Min km is set), so it can never accidentally show up as one of the "obfuscated" results. The very first click for a given address has to look it up; every click after that uses a city already fetched in the background right after the previous copy, so it's instant — until the list runs out, when it wraps back to the top. If a lookup still fails after a retry, that end falls back to its real address. Delivery is only swapped when it's a genuinely different place from loading. Any intermediate stops always stay accurate.</div>
+                <label style="font-weight:bold; font-size:12px; color:#475569; display:block; margin-top:10px;">City Ranking Strategy</label>
+                <div style="display:flex; flex-direction:column; gap:4px; margin-top:5px; font-size:13px; color:#000;">
+                    <label><input type="radio" name="pcfg-rankmode" id="pcfg-rankmode-population" ${pc.locationObfuscation.rankingMode === 'population' ? 'checked' : ''}> Largest population first (original)</label>
+                    <label><input type="radio" name="pcfg-rankmode" id="pcfg-rankmode-popdist" ${pc.locationObfuscation.rankingMode === 'pop_per_dist' ? 'checked' : ''}> Population ÷ distance (mild proximity bias)</label>
+                    <label><input type="radio" name="pcfg-rankmode" id="pcfg-rankmode-popdist2" ${pc.locationObfuscation.rankingMode === 'pop_per_dist2' ? 'checked' : ''}> Population ÷ distance² (strong proximity bias)</label>
+                </div>
+                <div style="font-size:10px; color:#94a3b8; margin-top:4px;">"Largest population first" can surface a major city near the edge of your radius even when much closer, smaller towns exist — fine if that doesn't bother you. The ÷distance options favor genuinely nearby places over distant big cities; ÷distance² favors it more strongly. This only re-ranks whatever Overpass already found inside Min/Max km — it can't invent closer candidates a tighter Max km would otherwise reveal.</div>
+            </div>
+
+            <div style="margin-bottom: 14px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">Time Offsets (Hours)</label>
+                <div style="display:flex; justify-content:space-between; margin-top:5px; font-size:13px; color:#000;">
+                    <div>Loading: <input type="number" id="pcfg-off-load" value="${pc.offsetLoad}" style="width:50px; text-align:center;"></div>
+                    <div>Delivery: <input type="number" id="pcfg-off-del" value="${pc.offsetDel}" style="width:50px; text-align:center;"></div>
+                </div>
+            </div>
+
+            <div style="margin-bottom: 14px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">LDM / Weight Randomization — Band A (small: LDM&lt;4 &amp; Wt&lt;1t)</label>
+                ${bandFieldsHtml('pcfg-a', pc.jitter.bandA, ' (≤4)', ' (≤1t)')}
+            </div>
+
+            <div style="margin-bottom: 14px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">LDM / Weight Randomization — Band B (medium: LDM 4–6.3 &amp; Wt 1–3.2t)</label>
+                ${bandFieldsHtml('pcfg-b', pc.jitter.bandB, ' (≤6.3)', ' (≤3.2t)')}
+            </div>
+
+            <div style="margin-bottom: 14px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">LDM / Weight Randomization — Other Loads (anything outside Band A/B)</label>
+                ${bandFieldsHtml('pcfg-other', pc.jitter.bandOther, ' (0=no cap)', ' (0=no cap)')}
+                <div style="font-size:10px; color:#94a3b8; margin-top:4px;">Catches every load that doesn't match Band A or B (e.g. a normal full truckload) — without this, those would never get randomized. A cap of 0 leaves that value uncapped.</div>
+            </div>
+
+            <div style="margin-bottom: 14px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">Typ nadwozia (edit, add, remove, or rename tags)</label>
+                <div id="pcfg-bt-list" style="display:flex; flex-direction:column; gap:4px; margin-top:6px;"></div>
+                <button type="button" id="pcfg-bt-add" style="margin-top:6px; padding:4px 10px; border:1px dashed #94a3b8; background:#f8fafc; color:#475569; border-radius:4px; font-size:11px; cursor:pointer;">+ Add tag</button>
+            </div>
+
+            <div style="margin-bottom: 6px;">
+                <label style="font-weight:bold; font-size:12px; color:#475569;">Wielkość pojazdu (edit, add, remove, or rename tags)</label>
+                <div id="pcfg-vs-list" style="display:flex; flex-direction:column; gap:4px; margin-top:6px;"></div>
+                <button type="button" id="pcfg-vs-add" style="margin-top:6px; padding:4px 10px; border:1px dashed #94a3b8; background:#f8fafc; color:#475569; border-radius:4px; font-size:11px; cursor:pointer;">+ Add tag</button>
+            </div>
+
+            <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:10px;">
+                <button id="pcfg-save" style="padding:6px 12px; border:none; background:#ea580c; color:#fff; border-radius:4px; font-weight:bold; cursor:pointer;">Save Posting Settings</button>
+            </div>
+        `;
+
+        panel.appendChild(body);
+        shadowRoot.appendChild(panel);
+
+        const btList = shadowRoot.getElementById('pcfg-bt-list');
+        const vsList = shadowRoot.getElementById('pcfg-vs-list');
+        renderTagList(btList, pc.bodyTypeTags);
+        renderTagList(vsList, pc.vehicleSizeTags);
+
+        shadowRoot.getElementById('pcfg-bt-add').addEventListener('click', () => {
+            btList.appendChild(buildTagRow({ text: '', enabled: true }));
+        });
+        shadowRoot.getElementById('pcfg-vs-add').addEventListener('click', () => {
+            vsList.appendChild(buildTagRow({ text: '', enabled: true }));
+        });
+
+        shadowRoot.getElementById('pcfg-save').onclick = () => {
+            pc.showLoadingAddress = shadowRoot.getElementById('pcfg-loadaddr').checked;
+            pc.showDeliveryAddress = shadowRoot.getElementById('pcfg-deladdr').checked;
+            pc.showLoading = shadowRoot.getElementById('pcfg-load').checked;
+            pc.showDelivery = shadowRoot.getElementById('pcfg-del').checked;
+            pc.showDims = shadowRoot.getElementById('pcfg-dims').checked;
+            pc.showNotes = shadowRoot.getElementById('pcfg-notes').checked;
+            pc.showBodyType = shadowRoot.getElementById('pcfg-bodytype').checked;
+            pc.showVehicleSize = shadowRoot.getElementById('pcfg-vehiclesize').checked;
+
+            pc.labels.loadingAddress = shadowRoot.getElementById('pcfg-label-loadaddr').value;
+            pc.labels.deliveryAddress = shadowRoot.getElementById('pcfg-label-deladdr').value;
+            pc.labels.loading = shadowRoot.getElementById('pcfg-label-load').value;
+            pc.labels.delivery = shadowRoot.getElementById('pcfg-label-del').value;
+            pc.labels.dims = shadowRoot.getElementById('pcfg-label-dims').value;
+            pc.labels.notes = shadowRoot.getElementById('pcfg-label-notes').value;
+            pc.labels.bodyType = shadowRoot.getElementById('pcfg-label-bodytype').value;
+            pc.labels.vehicleSize = shadowRoot.getElementById('pcfg-label-vehiclesize').value;
+
+            pc.locationObfuscation.obfuscateLoading = shadowRoot.getElementById('pcfg-locobf-loading').checked;
+            pc.locationObfuscation.obfuscateDelivery = shadowRoot.getElementById('pcfg-locobf-delivery').checked;
+            let locMin = parseFloat(shadowRoot.getElementById('pcfg-locobf-min').value);
+            let locMax = parseFloat(shadowRoot.getElementById('pcfg-locobf-max').value);
+            pc.locationObfuscation.minKm = isNaN(locMin) ? 10 : Math.max(0, locMin);
+            pc.locationObfuscation.maxKm = isNaN(locMax) ? 100 : Math.max(pc.locationObfuscation.minKm, locMax);
+
+            if (shadowRoot.getElementById('pcfg-rankmode-popdist').checked) pc.locationObfuscation.rankingMode = 'pop_per_dist';
+            else if (shadowRoot.getElementById('pcfg-rankmode-popdist2').checked) pc.locationObfuscation.rankingMode = 'pop_per_dist2';
+            else pc.locationObfuscation.rankingMode = 'population';
+
+            pc.offsetLoad = parseInt(shadowRoot.getElementById('pcfg-off-load').value || '0', 10);
+            pc.offsetDel = parseInt(shadowRoot.getElementById('pcfg-off-del').value || '0', 10);
+
+            const readBand = (prefix) => ({
+                ldmMin: parseFloat(shadowRoot.getElementById(`${prefix}-ldm-min`).value) || 0,
+                ldmMax: parseFloat(shadowRoot.getElementById(`${prefix}-ldm-max`).value) || 0,
+                ldmStep: Math.abs(parseFloat(shadowRoot.getElementById(`${prefix}-ldm-step`).value)) || 0.2,
+                ldmCap: parseFloat(shadowRoot.getElementById(`${prefix}-ldm-cap`).value) || 0,
+                wtMin: parseFloat(shadowRoot.getElementById(`${prefix}-wt-min`).value) || 0,
+                wtMax: parseFloat(shadowRoot.getElementById(`${prefix}-wt-max`).value) || 0,
+                wtStep: Math.abs(parseFloat(shadowRoot.getElementById(`${prefix}-wt-step`).value)) || 0.2,
+                wtCap: parseFloat(shadowRoot.getElementById(`${prefix}-wt-cap`).value) || 0
+            });
+            pc.jitter.bandA = readBand('pcfg-a');
+            pc.jitter.bandB = readBand('pcfg-b');
+            pc.jitter.bandOther = readBand('pcfg-other');
+
+            pc.bodyTypeTags = readTagList(btList);
+            pc.vehicleSizeTags = readTagList(vsList);
+
+            savePostingConfig();
+            renderTagList(btList, pc.bodyTypeTags);
+            renderTagList(vsList, pc.vehicleSizeTags);
+
+            const saveBtn = shadowRoot.getElementById('pcfg-save');
+            const baseText = saveBtn.innerText;
+            saveBtn.innerText = '✅ Saved';
+            setTimeout(() => { saveBtn.innerText = baseText; }, 1500);
+        };
+
+        // --- Drag Mechanics (own closure state; independent of main menu drag) ---
+        let isDraggingPost = false, startXP, startYP, initLeftP, initTopP;
+        header.addEventListener('mousedown', (e) => {
+            isDraggingPost = true;
+            startXP = e.clientX;
+            startYP = e.clientY;
+            initLeftP = parseInt(panel.style.left || 0, 10);
+            initTopP = parseInt(panel.style.top || 0, 10);
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isDraggingPost) return;
+            panel.style.left = (initLeftP + (e.clientX - startXP)) + 'px';
+            panel.style.top = (initTopP + (e.clientY - startYP)) + 'px';
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (isDraggingPost) {
+                localStorage.setItem('tm-post-panel-left', panel.style.left);
+                localStorage.setItem('tm-post-panel-top', panel.style.top);
+            }
+            isDraggingPost = false;
+        });
+    }
+
+    // Shows/hides the Posting Settings panel and persists the open/closed state.
+    function togglePostingSettingsPanel() {
+        const panel = shadowRoot.getElementById('tm-post-settings-panel');
+        if (!panel) return;
+        const willOpen = panel.style.display === 'none';
+        panel.style.display = willOpen ? 'flex' : 'none';
+        localStorage.setItem('tm-post-panel-open', willOpen ? 'true' : 'false');
+    }
+
+    // --- UI Factory: Floating Menu Construction (Inside Shadow DOM) ---
+    function buildFloatingMenu() {
+        initShadowDOM();
+        buildPostingSettingsPanel(); // idempotent; own ID check, own persistence
+        if (shadowRoot.getElementById('tm-cargo-floating-menu')) return;
+
+        const menu = document.createElement('div');
+        menu.id = 'tm-cargo-floating-menu';
+        menu.style.position = 'absolute'; // Changed to absolute relative to fixed 0x0 wrapper
+        menu.style.width = '340px';
+        menu.style.backgroundColor = '#ffffff';
+        menu.style.border = '1px solid #cbd5e1';
+        menu.style.borderRadius = '8px';
+        menu.style.boxShadow = '0 10px 25px rgba(0,0,0,0.15)';
+        menu.style.fontFamily = 'Segoe UI, system-ui, -apple-system, sans-serif';
+        menu.style.display = 'flex';
+        menu.style.flexDirection = 'column';
+        menu.style.overflow = 'hidden';
+        menu.style.boxSizing = 'border-box';
+        menu.style.pointerEvents = 'auto'; // Re-enable pointer events for the menu
+
+        const savedLeft = localStorage.getItem('tm-cargo-menu-left');
+        const savedTop = localStorage.getItem('tm-cargo-menu-top');
+
+        // Calculate viewport width/height to ensure fallback positioning is correct
+        if (savedLeft && savedTop) {
+            menu.style.left = savedLeft;
+            menu.style.top = savedTop;
+        } else {
+            menu.style.left = (window.innerWidth - 360) + 'px';
+            menu.style.top = '120px';
+        }
+
+        // Header Grab Drag Handle
+        const header = document.createElement('div');
+        header.id = 'tm-cargo-header';
+        header.style.backgroundColor = '#0f172a';
+        header.style.color = '#ffffff';
+        header.style.padding = '12px 16px';
+        header.style.fontSize = '13px';
+        header.style.fontWeight = 'bold';
+        header.style.cursor = 'move';
+        header.style.userSelect = 'none';
+        header.style.display = 'flex';
+        header.style.justifyContent = 'space-between';
+        header.style.boxSizing = 'border-box';
+
+        const titleSpan = document.createElement('span');
+        titleSpan.innerHTML = box_title;
+        header.appendChild(titleSpan);
+
+        // Settings Gear Icon Trigger
+        const cfgBtn = document.createElement('span');
+        cfgBtn.innerHTML = '⚙️';
+        cfgBtn.style.cursor = 'pointer';
+        cfgBtn.title = 'Open Settings';
+        cfgBtn.onclick = (e) => { e.stopPropagation(); openSettingsModal(); };
+        header.appendChild(cfgBtn);
+
+        menu.appendChild(header);
+
+        const content = document.createElement('div');
+        content.style.padding = '15px';
+        content.style.display = 'flex';
+        content.style.flexDirection = 'column';
+        content.style.gap = '12px';
+        content.style.boxSizing = 'border-box';
+
+        // Pre-wrapped Live Text Window Layout Frame
+        const statusText = document.createElement('div');
+        statusText.id = 'tm-cargo-status-text';
+        statusText.style.fontSize = '12px';
+        statusText.style.color = '#475569';
+        statusText.style.lineHeight = '1.6';
+        statusText.style.padding = '10px';
+        statusText.style.backgroundColor = '#f8fafc';
+        statusText.style.borderRadius = '6px';
+        statusText.style.border = '1px dashed #e2e8f0';
+        statusText.style.whiteSpace = 'pre-wrap';
+        statusText.style.transition = 'background-color 0.2s, border-color 0.2s';
+        statusText.style.boxSizing = 'border-box';
+        statusText.innerHTML = '<em>Select a freight offer details panel...</em>';
+        content.appendChild(statusText);
+
+        // Clipboard Copy Action Trigger Button
+        const actionBtn = document.createElement('button');
+        actionBtn.id = 'tm-cargo-action-btn';
+        actionBtn.innerText = '📋 Copy Short Route Template';
+        actionBtn.style.display = 'block';
+        actionBtn.style.width = '100%';
+        actionBtn.style.textAlign = 'center';
+        actionBtn.style.backgroundColor = '#e2e8f0';
+        actionBtn.style.color = '#94a3b8';
+        actionBtn.style.padding = '10px 14px';
+        actionBtn.style.borderRadius = '6px';
+        actionBtn.style.fontWeight = 'bold';
+        actionBtn.style.border = 'none';
+        actionBtn.style.pointerEvents = 'none';
+        actionBtn.style.cursor = 'not-allowed';
+        actionBtn.style.transition = 'all 0.2s ease';
+        actionBtn.style.boxSizing = 'border-box';
+        actionBtn.style.fontFamily = 'inherit';
+        content.appendChild(actionBtn);
+
+        // Copy with Country Codes + Postcodes Button
+        const codesBtn = document.createElement('button');
+        codesBtn.id = 'tm-cargo-codes-btn';
+        codesBtn.innerText = '🏷️ Copy Codes + Postcodes';
+        codesBtn.style.display = 'block';
+        codesBtn.style.width = '100%';
+        codesBtn.style.textAlign = 'center';
+        codesBtn.style.backgroundColor = '#e2e8f0';
+        codesBtn.style.color = '#94a3b8';
+        codesBtn.style.padding = '10px 14px';
+        codesBtn.style.borderRadius = '6px';
+        codesBtn.style.fontWeight = 'bold';
+        codesBtn.style.border = 'none';
+        codesBtn.style.pointerEvents = 'none';
+        codesBtn.style.cursor = 'not-allowed';
+        codesBtn.style.transition = 'all 0.2s ease';
+        codesBtn.style.boxSizing = 'border-box';
+        codesBtn.style.fontFamily = 'inherit';
+        content.appendChild(codesBtn);
+
+        codesBtn.addEventListener('click', executeCodesCopy);
+
+        // Organise & Copy for Posting Row (own button + dedicated settings toggle)
+        const postRow = document.createElement('div');
+        postRow.style.display = 'flex';
+        postRow.style.gap = '6px';
+        postRow.style.width = '100%';
+        postRow.style.boxSizing = 'border-box';
+
+        const postBtn = document.createElement('button');
+        postBtn.id = 'tm-cargo-post-btn';
+        postBtn.innerText = POST_BTN_DEFAULT_TEXT;
+        postBtn.style.flex = '1';
+        postBtn.style.textAlign = 'center';
+        postBtn.style.backgroundColor = '#e2e8f0';
+        postBtn.style.color = '#94a3b8';
+        postBtn.style.padding = '10px 14px';
+        postBtn.style.borderRadius = '6px';
+        postBtn.style.fontWeight = 'bold';
+        postBtn.style.border = 'none';
+        postBtn.style.pointerEvents = 'none';
+        postBtn.style.cursor = 'not-allowed';
+        postBtn.style.transition = 'all 0.2s ease';
+        postBtn.style.boxSizing = 'border-box';
+        postBtn.style.fontFamily = 'inherit';
+        postRow.appendChild(postBtn);
+
+        postBtn.addEventListener('click', executePostingCopy);
+
+        const postCfgBtn = document.createElement('button');
+        postCfgBtn.id = 'tm-cargo-post-cfg-btn';
+        postCfgBtn.innerText = '⚙️';
+        postCfgBtn.title = 'Posting Export Settings';
+        postCfgBtn.style.flex = '0 0 40px';
+        postCfgBtn.style.textAlign = 'center';
+        postCfgBtn.style.backgroundColor = '#cbd5e1';
+        postCfgBtn.style.color = '#0f172a';
+        postCfgBtn.style.padding = '10px 6px';
+        postCfgBtn.style.borderRadius = '6px';
+        postCfgBtn.style.fontWeight = 'bold';
+        postCfgBtn.style.border = 'none';
+        postCfgBtn.style.cursor = 'pointer';
+        postCfgBtn.style.transition = 'all 0.2s ease';
+        postCfgBtn.style.boxSizing = 'border-box';
+        postCfgBtn.style.fontFamily = 'inherit';
+        postCfgBtn.onmouseenter = () => postCfgBtn.style.backgroundColor = '#94a3b8';
+        postCfgBtn.onmouseleave = () => postCfgBtn.style.backgroundColor = '#cbd5e1';
+        postCfgBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePostingSettingsPanel(); });
+        postRow.appendChild(postCfgBtn);
+
+        content.appendChild(postRow);
+
+        // Paste Freight Info Button — always enabled, no offer selection required
+        const pasteBtn = document.createElement('button');
+        pasteBtn.id = 'tm-cargo-paste-btn';
+        pasteBtn.innerText = '📥 Paste Freight Info for Posting';
+        pasteBtn.style.display = 'block';
+        pasteBtn.style.width = '100%';
+        pasteBtn.style.textAlign = 'center';
+        pasteBtn.style.backgroundColor = '#fb923c';
+        pasteBtn.style.color = '#ffffff';
+        pasteBtn.style.padding = '10px 14px';
+        pasteBtn.style.borderRadius = '6px';
+        pasteBtn.style.fontWeight = 'bold';
+        pasteBtn.style.border = 'none';
+        pasteBtn.style.cursor = 'pointer';
+        pasteBtn.style.transition = 'all 0.2s ease';
+        pasteBtn.style.boxSizing = 'border-box';
+        pasteBtn.style.fontFamily = 'inherit';
+        pasteBtn.onmouseenter = () => pasteBtn.style.backgroundColor = '#f97316';
+        pasteBtn.onmouseleave = () => pasteBtn.style.backgroundColor = '#fb923c';
+        pasteBtn.addEventListener('click', openPasteModal);
+        content.appendChild(pasteBtn);
+
+        // Open Route in Google Maps (new tab) Button
+        const mapsBtn = document.createElement('button');
+        mapsBtn.id = 'tm-cargo-maps-btn';
+        mapsBtn.innerText = '🗺️ Open Route in Google Maps';
+        mapsBtn.style.display = 'block';
+        mapsBtn.style.width = '100%';
+        mapsBtn.style.textAlign = 'center';
+        mapsBtn.style.backgroundColor = '#e2e8f0';
+        mapsBtn.style.color = '#94a3b8';
+        mapsBtn.style.padding = '10px 14px';
+        mapsBtn.style.borderRadius = '6px';
+        mapsBtn.style.fontWeight = 'bold';
+        mapsBtn.style.border = 'none';
+        mapsBtn.style.pointerEvents = 'none';
+        mapsBtn.style.cursor = 'not-allowed';
+        mapsBtn.style.transition = 'all 0.2s ease';
+        mapsBtn.style.boxSizing = 'border-box';
+        mapsBtn.style.fontFamily = 'inherit';
+        content.appendChild(mapsBtn);
+
+        mapsBtn.addEventListener('click', () => {
+            if (currentMapUrl) {
+                window.open(currentMapUrl, '_blank', 'noopener,noreferrer');
+            }
+        });
+
+        menu.appendChild(content);
+        shadowRoot.appendChild(menu);
+
+        // --- Event Listeners for Clickable Box and Hover Visuals ---
+        statusText.addEventListener('click', () => {
+            if (currentOfferId && currentShortUrl !== "Shortening link...") {
+                executeUnifiedCopy();
+            }
+        });
+
+        statusText.addEventListener('mouseenter', () => {
+            if (currentOfferId && currentShortUrl !== "Shortening link...") {
+                statusText.style.backgroundColor = '#f1f5f9';
+                statusText.style.borderColor = '#94a3b8';
+            }
+        });
+
+        statusText.addEventListener('mouseleave', () => {
+            if (currentOfferId) {
+                statusText.style.backgroundColor = '#f8fafc';
+                statusText.style.borderColor = '#e2e8f0';
+            }
+        });
+
+        actionBtn.addEventListener('click', executeUnifiedCopy);
+
+        // --- Drag Mathematics Mechanics ---
+        let isDragging = false, startX, startY, initialLeft, initialTop;
+        header.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            initialLeft = parseInt(menu.style.left || 0, 10);
+            initialTop = parseInt(menu.style.top || 0, 10);
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const deltaX = e.clientX - startX;
+            const deltaY = e.clientY - startY;
+            menu.style.left = (initialLeft + deltaX) + 'px';
+            menu.style.top = (initialTop + deltaY) + 'px';
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (isDragging) {
+                localStorage.setItem('tm-cargo-menu-left', menu.style.left);
+                localStorage.setItem('tm-cargo-menu-top', menu.style.top);
+            }
+            isDragging = false;
+        });
+    }
+
+    // --- State Synchronization Loop Engine ---
+    async function processActiveRoute() {
+        buildFloatingMenu();
+
+        const statusText = shadowRoot.getElementById('tm-cargo-status-text');
+        const actionBtn = shadowRoot.getElementById('tm-cargo-action-btn');
+        const mapsBtn = shadowRoot.getElementById('tm-cargo-maps-btn');
+        const codesBtn = shadowRoot.getElementById('tm-cargo-codes-btn');
+        const postBtn = shadowRoot.getElementById('tm-cargo-post-btn');
+        if (!statusText || !actionBtn) return;
+
+        const testCountryNode = document.querySelector('[data-testid="LoadingPlacesView/loadingPlaceCountry_0"]');
+
+        if (testCountryNode) {
+            let stops = collectStops();
+
+            // Signature spans every stop so the route refreshes when the
+            // selected offer changes, including multi-stop / round trips.
+            let uniqueSignature = stops.map(s => `${s.country}_${s.city}`).join('|');
+
+            if (currentOfferId !== uniqueSignature) {
+                currentOfferId = uniqueSignature;
+
+                let longUrl = buildMapsUrl(stops);
+
+                currentMapUrl = longUrl;
+
+                // Full directions URL is ready immediately (no shortening required)
+                if (mapsBtn && longUrl) {
+                    mapsBtn.style.backgroundColor = '#0f9d58';
+                    mapsBtn.style.color = '#ffffff';
+                    mapsBtn.style.pointerEvents = 'auto';
+                    mapsBtn.style.cursor = 'pointer';
+                    mapsBtn.onmouseenter = () => mapsBtn.style.backgroundColor = '#0b8043';
+                    mapsBtn.onmouseleave = () => mapsBtn.style.backgroundColor = '#0f9d58';
+                }
+
+                // Codes/postcodes are read straight from the DOM (no shortening)
+                if (codesBtn) {
+                    codesBtn.style.backgroundColor = '#7c3aed';
+                    codesBtn.style.color = '#ffffff';
+                    codesBtn.style.pointerEvents = 'auto';
+                    codesBtn.style.cursor = 'pointer';
+                    codesBtn.onmouseenter = () => codesBtn.style.backgroundColor = '#6d28d9';
+                    codesBtn.onmouseleave = () => codesBtn.style.backgroundColor = '#7c3aed';
+                }
+
+                // Posting export is also read straight from the DOM (no shortening)
+                if (postBtn) {
+                    postBtn.style.backgroundColor = '#ea580c';
+                    postBtn.style.color = '#ffffff';
+                    postBtn.style.pointerEvents = 'auto';
+                    postBtn.style.cursor = 'pointer';
+                    postBtn.onmouseenter = () => postBtn.style.backgroundColor = '#c2410c';
+                    postBtn.onmouseleave = () => postBtn.style.backgroundColor = '#ea580c';
+                }
+
+                currentShortUrl = "Shortening link...";
+                statusText.innerText = generateFormattedTemplate(currentShortUrl);
+                statusText.style.cursor = 'wait';
+                statusText.title = 'Generating route links...';
+
+                actionBtn.style.backgroundColor = '#f59e0b';
+                actionBtn.innerText = '⏳ Shortening Link...';
+                actionBtn.style.pointerEvents = 'none';
+
+                let compressedUrl = await fetchShortenedUrl(longUrl);
+
+                if (currentOfferId === uniqueSignature) {
+                    currentShortUrl = compressedUrl;
+                    statusText.innerText = generateFormattedTemplate(currentShortUrl);
+                    statusText.style.cursor = 'pointer';
+                    statusText.title = 'Click inside this text block to copy everything!';
+
+                    actionBtn.innerText = '📋 Copy Short Route Template';
+                    actionBtn.style.backgroundColor = '#0284c7';
+                    actionBtn.style.color = '#ffffff';
+                    actionBtn.style.pointerEvents = 'auto';
+                    actionBtn.style.cursor = 'pointer';
+
+                    actionBtn.onmouseenter = () => actionBtn.style.backgroundColor = '#0369a1';
+                    actionBtn.onmouseleave = () => actionBtn.style.backgroundColor = '#0284c7';
+                }
+            }
+        } else {
+            if (currentOfferId !== "") {
+                currentOfferId = "";
+                currentShortUrl = "";
+                currentMapUrl = "";
+                statusText.innerHTML = '<em>Select a freight offer details panel...</em>';
+                statusText.style.cursor = 'default';
+                statusText.title = '';
+
+                actionBtn.innerText = '📋 Copy Short Route Template';
+                actionBtn.style.backgroundColor = '#e2e8f0';
+                actionBtn.style.color = '#94a3b8';
+                actionBtn.style.pointerEvents = 'none';
+                actionBtn.style.cursor = 'not-allowed';
+                actionBtn.onmouseenter = null;
+                actionBtn.onmouseleave = null;
+
+                if (mapsBtn) {
+                    mapsBtn.style.backgroundColor = '#e2e8f0';
+                    mapsBtn.style.color = '#94a3b8';
+                    mapsBtn.style.pointerEvents = 'none';
+                    mapsBtn.style.cursor = 'not-allowed';
+                    mapsBtn.onmouseenter = null;
+                    mapsBtn.onmouseleave = null;
+                }
+
+                if (codesBtn) {
+                    codesBtn.style.backgroundColor = '#e2e8f0';
+                    codesBtn.style.color = '#94a3b8';
+                    codesBtn.style.pointerEvents = 'none';
+                    codesBtn.style.cursor = 'not-allowed';
+                    codesBtn.onmouseenter = null;
+                    codesBtn.onmouseleave = null;
+                }
+
+                if (postBtn) {
+                    postBtn.style.backgroundColor = '#e2e8f0';
+                    postBtn.style.color = '#94a3b8';
+                    postBtn.style.pointerEvents = 'none';
+                    postBtn.style.cursor = 'not-allowed';
+                    postBtn.onmouseenter = null;
+                    postBtn.onmouseleave = null;
+                }
+            }
+        }
+    }
+
+    const observer = new MutationObserver(processActiveRoute);
+    observer.observe(document.body, { childList: true, subtree: true });
+    setInterval(processActiveRoute, 350);
+})();
