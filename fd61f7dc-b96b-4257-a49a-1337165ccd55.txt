@@ -19,7 +19,7 @@
 
 (function() {
     'use strict';
-
+//AA
     // Failsafe: Absolutely prevent execution inside chat/widget iframes
     if (window.top !== window.self) return;
 
