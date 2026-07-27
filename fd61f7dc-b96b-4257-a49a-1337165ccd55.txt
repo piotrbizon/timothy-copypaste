@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GEMINI
 // @namespace    http://tampermonkey.net/
-// @version      19.11
+// @version      19.112
 // @description  Clickable dashboard isolated in a zero-impact Shadow DOM. Multi-stop/round-trip aware Google Maps routing (collapses consecutive duplicate stops); export uses first loading and last delivery times. Adds a separate "Posting" export with dedicated "Loading address"/"Delivery address" lines ([Country Code] [postcode] [city]), LDM/weight randomization, body-type/vehicle-size tags, and loading/delivery location obfuscation via Overpass+Nominatim with a selectable City Ranking Strategy (fixed: a city-center reverse-geocode sometimes lands on a quarter/neighborhood feature with no postcode tag at all, e.g. "NL Zwolle" with no postcode — now retries once at a finer zoom level when that happens) and verbose console logging ([TM-Obfuscate] prefix) for diagnosing any issues. Includes its own persistent settings panel and a "Paste Freight Info" option that runs pasted text through the exact same pipeline.
 // @author       Gemini
 // @match        https://my.timocom.com/*
